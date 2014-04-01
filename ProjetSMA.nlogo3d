@@ -1,0 +1,4786 @@
+; Simulation MAS d'une mission humanitaire avec drones
+; par Olivier Hotel et Stephen Larroque
+
+; TODO NOTES: placer la liste des todos ici
+; x implementer base communication asynchrone drones par relais de messages
+; x tester communication async avec position exchange (et donc move-towards des drones se basera sur beliefs, bon exemple pour usage)
+; x implementer belief et procedure drones change-altitude (pour l'instant aleatoirement change d'altitude, et ifelse zcor >= hauteAlt [ alors on est en haute alt ] [ sinon basseAlt ] pour definir dans quelle altitude on est. Implementer aussi relai QG en haute alt (colorier les drones).
+; x comment savoir si on est connecté au QG? Facile: creer un breed QG avec BDI qui reply quand recoit un qg-beacon! Les agents testent regulierement tant qu'ils sont connectés (c'est celui qui les connecte qui le dit), et si ca marche pas alors on enleve le belief.
+; faire repondre true toujours au QG si play-mode = true
+; x algo steering behaviors pour rester en communication
+; x basse altitude plus rapide mais plus visible par les ennemis ; haute altitude moins rapide mais moins visible
+; x jeu controle d'une voiture leader
+; x detection d'ennemi aggressifs tres simple avec shape netlogo (si shape correspond a ennemi alors c'est bon identifie, simule une comparaison d'image de base de donnees)
+; x (criteres a debattre) detection d'ennemi par comportement: faire un score "suspect-score" qui va simplement ajouter plusieurs criteres simples (est-ce que ennemi proche d'une montagne car ca peut etre une embuscade, est-ce que l'ennemi se deplace, est-ce qu'il est sur le chemin d'un des convois...). Score 2/3 = on tire.
+;   x certains ennemis neutres (citizen) peuvent etre consideres comme ennemis aggressifs et des ennemis aggressifs peuvent etre consideres comme neutre
+; x gestion fuel et munitions (baisse avec le temps et donc gestion car faut rentrer et calculer distance tant qu'on a assez de fuel)
+; - Fog of war quand les drones reperent un ennemi (sinon les ennemis sont caches)
+; - convoi se scinde auto si un ennemi dans un range du leader (choisit une autre voiture au hasard du convoi et la fait devenir leader). Attention: mettre variable globale last-cut-time pour ne pas scinder plusieurs fois pour le meme ennemi, il faut laisser passer quelques ticks (genre 500)!
+; x (optionel) animation missiles de l'ennemi jusqu'a la cible. Quand tire un missile, faire un new-breed missile et set func-callback (avec params) et set goal (la ou le missile va se diriger, ca peut etre un agent comme un drone). Comme ca func generique pour tirer missiles (drones pourront aussi l'utiliser) et quand atteint la cible ca fera un callback a une func genre missile-hit-drone
+; x manoeuvre d'evitement des ennemis
+; x corriger drone-change-pitch (ce qui corrigera drone-ascend et drone-descend) car les drones des fois vont dans le pitch oppose a ce qu'il faut (en haut au lieu d'en bas, et inversement). Je ne sais pas du tout pourquoi et j'ai essaye pleins de trucs, si quelqu'un a une idee...
+;
+; x drones strategies:
+;  x quand cible acceptee, aller chercher d'autres drones pour pouvoir tirer
+;  x aller en repérage et revenir (peut se servir du plan pour explorer le chemin en avant, avec un peu d'aléatoire pour visiter a gauche et a droite)
+;  MIEUX: envoyer plusieurs drones si dispos pour explorer le chemin, et les forcer a couvrir le plus d'espace possible de part et d'autre du chemin. Mais explorer que le chemin, sert moins d'aller explorer ailleurs!
+;  x exploration aléatoire, sert quand même à éviter les embuscades
+;  - exploration aléatoire améliorée: garder carte des patch visités, et n'explorer que celles pas encore explorées, de façon efficace (trouver un algo?), permettra de dire que c'est comme si était dans une étape du voyage avec un périmètre délimité que les drones doivent couvrir. Ce sera super rapide et plus de danger pour le convoi.
+;  rajouter variable patchs-own explored pour savoir si drones ont exploré cette zone (tous les patchs dans le radius de vision d'un drone sont considérés comme explorés). Ou on s'en fout et on fait que visiter sans marquer les patchs?
+
+__includes ["bdi.nls" "communication.nls"]
+
+breed [enemies enemy]
+breed [citizens citizen] ; agent neutre (possiblement ennemis mais pas sur)
+breed [convois convoi]
+breed [drones drone]
+breed [halos halo]
+breed [envconstructors envconstructor]
+breed [waypoints waypoint]
+breed [missiles missile]
+breed [HQs HQ]
+directed-link-breed [path-links path-link]
+undirected-link-breed [dummy-links dummy-link]
+directed-link-breed [convoi-links convoi-link]
+
+globals [mapAlt solAlt basseAlt hauteAlt ; variables topologiques Z discretise: definit le niveau ou se trouvent toutes les informations de la carte (obstacles base etc.) car en 2D, niveau au sol ou se trouvent les agents, niveau basse altitude et niveau haute altitude
+  base-patches base-entry base-central ; precache: definit ou se trouvent les patchs de la base d'atterrissage, le patch d'entree sur la piste d'atterrissage, et le patch ou doivent s'arreter les drones pour se recharger. Permet d'evaluer rapidement la distance et les besoins des drones (quand ils doivent rentrer a la base)
+  as-cost as-path ; variables globales pour les chemins AStar: le cout d'un pas sur un patch, et as-path est la liste des plans, un pour chaque convoi leader
+  max-fuel max-ammo ; fuel et munitions maximum donnés aux drones. C'est le montant qu'ils auront au debut de la simulation, et aussi a chaque fois qu'ils passeront se recharger a la base.
+  fuel-dec ; how much fuel will be decremented at each iteration?
+  mission-completed? mission-failed?
+  play-mode-enabled? p-up p-down p-left p-right p-speed p-angle p-max-speed p-max-angle p-cam-mode ; pour le Play Mode
+  send-interval ; pour la communication
+  ;hauteAltSpeedMod ; modifieur (deplace dans le GUI maintenant): combien on va diminuer la vitesse normale du drone en haute altitude ?
+  dist-R-set ; pour l'algorithme CPS
+  is-movie-recording?
+  ]
+
+patches-own [obstacle? base? hangar? objectif? bridge? ; variables topologiques au niveau mapAlt, permet de definir les patchs praticables et ceux qui sont des obstacles
+  as-closed as-heuristic as-prev-pos ; variables temporaires pour calculer les chemins AStar (effaces a chaque calcul de plan)
+  ]
+drones-own[intentions beliefs incoming-queue ; pour l'extension BDI
+  speed maxturn fuel ammo dead? will-die? ; variables comportementales et de besoins (will-die? est utilise pour les missiles, pour que les ennemis sachent que le drone va mourir donc il ne sert a rien de retirer)
+  fuel-safe-margin ; definit une marge de surete pour etre sur de partir quand il nous reste assez de fuel pour rentrer a la base (et pas trop peu!)
+  take-off-anim-frame landing-anim-frame prev-heading anim-tmp ; variables temporaires pour certaines procedures d'animation (decollage et atterrissage)
+  last-send-time last-seen-time ; for communication purposes
+  my-plan ; pour explorer le chemin en avant
+  current-exploration-plan ; pour savoir ce que fait le drone (0 rien) (1 reste pres du convois) (2 suit le chemin astar) (3 circulaire) (4 random)
+  strategy-begin-time ; pour pouvoir arreter une strategie qui a duree trop longtemps
+  altGoal ; pour changement d'altitude, on va y aller graduellement tout en faisant autrechose
+  circular-radius-random ; a bit of randomness in the radius of the circle patrol
+  ]
+convois-own[incoming-queue
+  finished? ; a atteint de but? Cette voiture (et celles la suivant) ont-elles fini le scenario?
+  leader? ; voiture leader du convoi (il peut y en avoir plusieurs si le convoi se scinde)
+  to-protect? ; voiture a proteger a tout prix?
+  genlongpath? ; ce leader doit generer un chemin alternatif? (utilise quand le convoi se scinde, pour eviter de calculer le chemin le plus court qui sera le meme que le chemin du premier leader)
+  dead?
+  speed maxdir ; vitesse des voitures et angle maximum
+  last-send-time ; pour communication
+  ]
+enemies-own[intentions beliefs incoming-queue ; pour l'extension BDI
+  moving? speed
+  ammo target-id target?
+  last-shot-time
+  dead? will-die?
+  ]
+citizens-own[intentions beliefs incoming-queue
+  moving? speed i-am-agressive?
+  ammo target-id target?
+  last-shot-time
+  dead? will-die?
+  ]
+missiles-own[speed maxturn my-target callback-func my-timeout] ; timeout pour eviter que les missiles n'atteignent jamais leur cible et continuent indefiniment
+HQs-own[incoming-queue] ; pour l'extension BDI, car le QG peut recevoir et renvoyer des messages
+
+
+
+;=======================
+;        SETUP
+;=======================
+
+to setup
+  ; Genere un monde jusqu'a ce qu'il soit possible au convoi d'arriver au but
+  let path-is-possible? false
+  while [not path-is-possible?] [
+    clear-all
+    if not debug and not debug-more [no-display] ; disable gui display to speedup processing, the time slider won't influence the setup procedure
+    setup-globals
+    set-default-shape halos "thin ring"
+    setup-env
+    clear-turtles ; permet de reinit les numeros who
+    setup-convois
+
+    ifelse n-cars <= 0 [
+      set path-is-possible? true
+    ]
+    ; Genere un premier chemin pour voir si c'est bon, sinon on regenere un autre monde
+    [
+      let start-path (plan-astar ([[patch-at 0 0 (pzcor * -1)] of patch-here] of one-of convois with [leader?]) (one-of patches with [objectif?]) false)
+      set as-path replace-item 0 as-path start-path
+      if not empty? start-path [ set path-is-possible? true]
+    ]
+  ]
+  if not debug and not debug-more [no-display]
+  setup-drones
+  setup-enemies
+  setup-citizens
+  setup-hq
+
+  setup-precache
+  display ; reenable gui display
+  reset-ticks
+end
+
+to setup-globals
+  set mapAlt 0
+  set solAlt 1
+  set basseAlt (floor max-pzcor / 3 * 2 - 1)
+  set hauteAlt (floor max-pzcor - 1)
+
+  set mission-completed? false
+  set mission-failed? false
+
+  set max-fuel d-fuel
+  set max-ammo d-ammo
+
+  set as-cost 1 ; cout pour se deplacer d'un patch
+  set as-path n-values n-cars [[]] ; un plan par voiture au maximum si toutes les voitures se scindent a un moment
+
+  set send-interval 10 ; en nombre de ticks
+
+  set play-mode-enabled? false
+
+  set dist-R-set []
+
+  set is-movie-recording? false
+end
+
+; Precaches places en variables globales pour des objets qui ne changeront plus une fois l'initialisation faite, afin d'accelerer les calculs par la suite (ca fait une GROSSE difference!)
+to setup-precache
+  set base-patches (patches with [base? and pzcor = mapAlt]) ; precache to speedup things
+  set base-entry max-one-of (base-patches with-min [pycor]) [pxcor]
+  set base-central min-one-of (base-patches with-min [pxcor]) [pycor]
+end
+
+to setup-env
+  ask patches [set obstacle? false set base? false set hangar? false set objectif? false set bridge? false]
+
+  ; Herbe
+  ask patches with [pzcor = mapAlt][set pcolor green + (random-float 2) - 1]
+
+  ; Montagnes
+  if n-mountains > 0 [ ask n-of n-mountains patches with [pzcor = solAlt and pxcor > 7 and pycor > 7] [ask  patches with [distance-nowrap myself < 3 and pzcor < 5] [set pcolor 33 + (random-float 2) - 1 set obstacle? true ask neighbors6 with [pzcor = mapAlt] [set obstacle? true]]] ]
+
+  ; Rivieres
+  if n-rivers > 0 [
+    repeat n-rivers [
+      ; On utilise un agent constructeur qui va se promener et construire une riviere a chaque pas
+      create-envconstructors 1 [
+        ; On le place au hasard sur le bord gauche ou sur le bord en bas de la carte
+        ifelse random-float 1 <= 0.5 [
+          set xcor 0
+          set ycor random max-pycor
+          set heading 90
+        ]
+        [
+          set ycor 0
+          set xcor random max-pxcor
+          set heading 0
+        ]
+        set zcor mapAlt
+        
+        ; Tag de la premiere case
+        ask patch-here [set pcolor blue set obstacle? true]
+        
+        ; Avance et tag les cases
+        repeat max-pxcor + max-pycor [
+          ; Change l'orientation aleatoirement
+          rt random 30 - 15
+          ; Avance d'un pas
+          fd 1
+          ; On tag au hasard soit une case de la riviere, soit un pont
+          ask patch-here [
+            ; Pont
+            ifelse random-float 1 <= 0.1 [
+              set pcolor brown
+              set bridge? true
+            ]
+            ; Riviere
+            [
+              set pcolor blue
+              set obstacle? true
+            ]
+          ]
+        ]
+        die
+      ]
+    ]
+  ]
+
+  ; Lacs
+  if n-lakes > 0 [ ask n-of n-lakes patches with [pzcor = mapAlt and pxcor > 7 and pycor > 7] [ask patches with [distance-nowrap myself < 4 and pzcor = mapAlt] [set pcolor blue set obstacle? true]] ]
+
+  ; Objectif
+  ask one-of patches with[obstacle? = false and base? = false and hangar? = false and pxcor >= (max-pxcor / 2) and pycor >= (max-pycor / 2) and pzcor = mapAlt][set objectif? true ask patch-at 0 0 2 [set pcolor yellow]]
+
+  ; Hangar (la ou les voitures du convois demarrent)
+  ask patches with[pzcor = mapAlt and pxcor >= 5 and pxcor < 7 and pycor >= 0 and pycor < 12][set pcolor 8 set hangar? true set obstacle? false]
+
+  ; Base de decollage et atterrissage pour les drones
+  ask patches with[pzcor = mapAlt and pxcor >= 3 and pxcor < 5 and pycor >= 0 and pycor < 12][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste verticale
+  ask patches with[pzcor = mapAlt and pycor = 0 and pxcor >= 0 and pxcor < 18][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste horizontale
+  ; Batiment (pour faire joli, ne sert a rien fonctionnellement)
+  ask patches with[pzcor <= solAlt and pxcor >= 0 and pxcor < 3 and pycor >= 0 and pycor < 5][set pcolor 3 set obstacle? true set base? false set hangar? false] ; Batiment
+  ask patches with [pzcor < 5 and pxcor = 0 and pycor = 0 and pzcor > 0 ] [ set pcolor 3 set obstacle? true set base? false set hangar? false] ; Antenne
+
+  ; Copie des obstacles: on s'assure que les patchs au niveau solAlt ont la meme valeur obstacle? que leur patch en-dessous au niveau mapAlt (assure que enemy-random-move fonctionne bien et facilite la detection des obstacles car pas besoin de regarder au niveau mapAlt mais directement dans les patchs solAlt)
+  ask patches with [[obstacle?] of patch-at 0 0 -1] [set obstacle? true]
+end
+
+to setup-enemies
+  if n-enemies > 0 [
+    create-enemies n-enemies
+    ask enemies
+    [
+      ; Init apparence
+      set shape "turret"
+      set color red
+      
+      ; Init position
+      move-to one-of patches with [pzcor = mapAlt and not any? (fast-in-radius-nowrap patches 2) with [obstacle?] and not any? (fast-in-radius-nowrap patches (e-sight-radius * 2)) with [base? or hangar?]]
+      set zcor solAlt
+      
+      ; Init BDI
+      set intentions []
+      set incoming-queue []
+      
+      ; Init variables
+      set speed 0.07 * simu-speed ; plus rapide que convoi mais moins que les drones
+      set moving? false
+      if random-float 1 < 0.5 [
+        set moving? true ; au hasard un ennemi sera fixe ou mobile
+        set shape "person soldier"
+      ]
+      set ammo e-ammo
+      set target? false
+      set target-id 0
+      set last-shot-time 0
+      set dead? false
+      set will-die? false
+    ]
+  ]
+end
+
+to setup-citizens
+  if n-citizens > 0 [
+    create-citizens n-citizens
+    ask citizens
+    [
+      ; Init apparence
+      set shape "person"
+      set color yellow
+      
+      ; Init position
+      move-to one-of patches with [pzcor = mapAlt and not any? (fast-in-radius-nowrap patches 2) with [obstacle?] and not any? (fast-in-radius-nowrap patches (e-sight-radius * 2)) with [base? or hangar?]]
+      set zcor solAlt
+      
+      ; Init BDI
+      set intentions []
+      set incoming-queue []
+      
+      ; Init variables
+      set speed 0.07 * simu-speed ; plus rapide que convoi mais moins que les drones
+      set moving? true ; les citoyens sont toujours capables de bouger
+      set ammo 0 ; pas de munition puisque l'agent n'a pas d'arme. C'est utilisé pour la detection behavior-based
+      set target? false
+      set target-id 0
+      set last-shot-time 0
+      set dead? false
+      set will-die? false
+
+      set i-am-agressive? false
+      if random-float 1 < 0.5 [
+        set i-am-agressive? true ; au hasard un citoyen sera agressif et attaquera les drones
+        set ammo e-ammo
+      ]
+    ]
+  ]
+end
+
+to setup-convois
+  if n-cars > 0 [
+    ; recupere dimensions de la base, pour pouvoir repartir les voitures de maniere uniforme
+    let base-min-pxcor min [pxcor] of (patches with [hangar? and pzcor = mapAlt])
+    let base-max-pxcor max [pxcor] of (patches with [hangar? and pzcor = mapAlt])
+    let base-min-pycor min [pycor] of (patches with [hangar? and pzcor = mapAlt])
+    let base-max-pycor max [pycor] of (patches with [hangar? and pzcor = mapAlt])
+    
+    ; creation des voitures du convoi et cortege
+    create-convois n-cars
+    ask convois
+    [
+      ; Init apparence NetLogo
+      set shape "car"
+      set color magenta
+
+      ; Init des structures BDI
+      set incoming-queue [] ; NE PAS TOUCHER
+
+      ; Init vars convois
+      set speed 0.05 * simu-speed
+      set maxdir 10 * simu-speed
+      set heading 0
+      set roll 0
+      set pitch 0
+      set finished? false
+      set leader? false
+      set to-protect? false
+      set genlongpath? false
+      set dead? false
+      
+      ; Visu
+      set label who ; on affiche leur numero pour plus facilement les reconnaitre
+    ]
+    
+    ; recupere l'id de la premiere voiture
+    let first-car min [who] of convois
+    let last-car max [who] of convois
+    
+    ; configuration du premier leader
+    ask convoi first-car [
+      set leader? true
+      set color orange
+      move-to patch base-max-pxcor base-max-pycor 1
+    ]
+    
+    ; configuration de la derniere voiture comme etant celle a proteger
+    ask convoi last-car [
+      set to-protect? true
+      set color yellow
+    ]
+    
+    ; placement des autres voitures non leader
+    if n-cars > 1 [
+      ; demande aux voitures non leader
+      ask turtle-set sort-on [who] convois with [who > first-car]
+      [
+        ; on cree un lien avec la voiture qui est devant
+        create-convoi-link-to turtle (who - 1)
+        ;if who >= 4 and who mod 2 = 0 [ create-convoi-link-with turtle (who - 3) ]
+        
+        ; placement de la voiture
+        ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+        set ycor base-max-pycor - (floor (who / 2) / (n-cars / 2) * (base-max-pycor - base-min-pycor)) ; d'une rangee de plus en plus basse toutes les deux voitures
+        set zcor solAlt
+      ]
+      
+    ]
+  ]
+end
+
+to setup-drones
+  if n-drones > 0 [
+    create-drones n-drones
+    ask drones
+    [
+      ; Init des vars des drones
+      set speed 0.1 * simu-speed
+      set maxturn 10; * simu-speed
+      set fuel-dec (1 / (1 / speed))
+
+      ; Init de la position
+      move-to one-of patches with [pxcor >= 5 and pycor = 0 and pzcor = solAlt and [base?] of patch-at 0 0 (solAlt * -1)]
+      set heading 270
+      set roll 0
+      set pitch 0
+      
+      ; Init de l'apparence
+      set shape "airplane"
+      set color cyan
+      set size 1.5
+      
+      ; Init des structures BDI
+      set beliefs [] ; NE PAS TOUCHER
+      set intentions [] ; NE PAS TOUCHER
+      set incoming-queue [] ; NE PAS TOUCHER
+      add-intention "drones-start" "true" ; But initial
+
+      ; Init frames d'animation
+      set take-off-anim-frame 0
+      set landing-anim-frame 0
+      set anim-tmp nobody
+      
+      ; Init des vars
+      set fuel max-fuel
+      set ammo max-ammo
+      set fuel-safe-margin max (list 20 (max-fuel / 50))
+      set dead? false ; quand le drone est mort definitivement
+      set will-die? false ; quand le drone va mourir car est marque par un missile qui est sur de le toucher
+      set altGoal false
+
+      ; Init des tables de communication
+      set last-send-time 0
+      set last-seen-time ntable:make
+
+      set my-plan []
+      set current-exploration-plan 0
+
+      ; Visualisation d'un halo de couverture sans-fil autour des drones
+      hatch-halos 1
+      [
+        set size (wifi-coverage-radius * 2)
+        set color yellow
+        set color lput 64  extract-rgb color
+        __set-line-thickness 0.5
+        create-dummy-link-with myself
+        [
+          tie hide-link
+        ]
+        if hide-wifi [ hide-turtle ]
+      ]
+      
+      set label who - min [who] of drones ; on affiche leur numero pour plus facilement les reconnaitre
+    ]
+  ]
+end
+
+to setup-hq
+  create-HQs 1 [
+    hide-turtle
+
+    set incoming-queue []
+  ]
+end
+
+
+
+;=======================
+;         MAIN
+;=======================
+
+to go
+  if not debug and not debug-more [no-display] ; disable gui display to speedup processing, the time slider won't influence the setup procedure
+
+  hq-think
+  convois-think
+  drones-think
+  enemies-think
+  citizens-think
+  missiles-think
+  visualization
+
+  if not mission-completed? and n-cars > 0 [ check-mission-completed ]
+  
+  tick
+
+  display ; reenable gui display
+
+  if is-movie-recording? [ movie-grab-view ]
+
+ ;; wait 0.1
+end
+
+to check-mission-completed
+  if one-of [finished?] of convois with [to-protect?] = true [
+    user-message "Bravo vous avez reussi a accomplir la mission!"
+    set mission-completed? true
+  ]
+end
+
+
+;-----------------------
+; SCATTERING ALGORITHM
+;-----------------------
+
+;-----
+; CPS
+;-----
+; Ref: Taisuke Izumi, Maria Gradinariu Potop-Butucaru, Sébastien Tixeuil: Connectivity-Preserving Scattering of Mobile Robots with Limited Visibility. SSS 2010: 319-331
+; Notes: fait une simplification ligne 9 - 11 pour ne pas avoir a calculer l'arc et la médiane. Du coup, quelque fois on perd la communication. Par contre cet algo pose des problemes dans le cas de notre projet car les drones ne sont pas stationnaires (pas des helicopteres mais des avions) :
+;   1) il se peut qu'un robot ne bouge pas d'après l'algo -> le drone se crash
+;   2) toujours d'après l'algo, les robot peuvent tourner a angle droit (par exemple) -> pas possible pour les drones
+; Une solution pourrait etre de remplacer le changement direct de position par une modelisation virtuelle de l'emplacement. En gros: on calcule les points ou devraient etre les drones de facon optimale pour assurer la connectivite, et on demande aux drones d'essayer de se diriger vers ces points. Ils ne seront donc pas toujours connectes, mais c'est pas grave car la communication est decentralisee donc ils s'echangeront les infos manquantes pendant le cours laps de temps ou ils ont du ajuster leurs positions.
+
+to CPS-algorithm
+  let Ri fast-in-radius-nowrap drones (wifi-coverage-radius - 0.1) ;petite arnaqua sans consequence
+  let Rip Ri with [distance-nowrap myself >= 0.9 * wifi-coverage-radius]
+  
+  if not-blocked? = true
+  [
+    set dist-R-set []
+    ask Ri [give-me-your-R myself]
+    let d []
+    foreach dist-R-set
+    [
+     ifelse ? < 0.5 [set d lput ? d][set d lput (1 - ?) d]
+    ]
+     set d min d
+     ; vecteur unitaire en dimension 2
+     let p1 random-float 1
+     let p2 sqrt 1 - p1 * p1
+     
+     if any? Rip
+     [
+      ; comment calculer le plus petit arc ?
+      ; comment calculer la bisectrice  ?
+      ; en attendant d'avoir une reponse efficace a ces questions, je traviail avec la moyenne
+       let x-boundary [xcor] of Rip 
+       let y-boundary [ycor] of Rip
+       let mx mean x-boundary
+       let my mean y-boundary
+       set p1 mx / (mx + my)
+       set p2 my / (mx + my)
+     ]
+     set p1 d * p1
+     set p2 d * p2
+     if any? Ri
+     [
+       let x-vitesse speed * p1 / 2
+       let y-vitesse speed * p2 / 2
+       if random-float 1 < 0.5 ; un peu de stochastique dans la vie
+       [
+         set x-vitesse x-vitesse / 2
+         set y-vitesse y-vitesse / 2
+;         set xcor xcor + speed * p1 / 4
+;         set ycor ycor + speed * p2 / 4
+       ]
+
+       let newheading acos (y-vitesse / (sqrt(x-vitesse * x-vitesse + y-vitesse * y-vitesse) + 0.000001))
+       let dirCorrection subtract-headings newheading heading
+
+       ifelse dirCorrection > maxturn [set dirCorrection maxturn]
+       [
+         if dirCorrection < maxturn * -1 [set dirCorrection maxturn * -1]
+       ]
+       
+       rt dirCorrection
+       
+       fd-drone-avoid-enemies
+     ]
+    ]
+  
+end
+
+to give-me-your-R[drone-ref]
+  set dist-R-set lput distance-nowrap drone-ref dist-R-set
+end
+
+to-report not-blocked?
+  let connected-drones fast-in-radius-nowrap drones wifi-coverage-radius
+  ifelse any? connected-drones
+  [
+      let x-connected [xcor] of connected-drones 
+      let y-connected [ycor] of connected-drones
+      let x-ref item 0 x-connected
+      let y-ref item 0 y-connected
+      let delta-x xcor - x-ref
+      let delat-y ycor - y-ref
+      let x-ref2 x-ref - delta-x
+      let y-ref2 y-ref - delat-y
+      
+      ; droite horizontale -> pas bloqué si tous au dessus ou en dessous de la droite
+      ifelse y-ref = y-ref2
+      [
+        ifelse all? connected-drones [ycor > y-ref] or all? connected-drones [ycor < y-ref]
+        [
+          report true
+        ]
+        [
+          report false
+        ]
+      ]
+      [
+        ; droite vecticale -> pas bloqué si tous les drones a droite ou a gauche de la droite
+        ifelse x-ref = x-ref2
+        [
+          ifelse all? connected-drones [xcor > x-ref] or all? connected-drones [xcor < x-ref]
+          [
+            report true
+          ]
+          [
+            report false
+          ]
+        ]
+        ; sinon, on calcule l'equation de la droite et on verifie qu'ils sont tous au dessus ou en dessous
+        [
+          let a (y-ref2 - y-ref) / (x-ref2 - x-ref)
+          let b y-ref - a * x-ref
+          ifelse all? connected-drones [ycor > a * xcor + b] or all? connected-drones [ycor < a * xcor + b]
+          [
+            report true
+          ]
+          [
+            report false
+          ]
+        ]
+      ]
+  
+  ]
+  [
+    report true
+  ]  
+end
+
+
+;-----------------------
+; DETECTION DES ENNEMIS
+;-----------------------
+
+; Detection d'ennemi par comparaison avec une bases d'images
+; Ici la base de donnee et le critere de comparaison est simplifie en comparant la shape NetLogo tout simplement.
+to-report drone-detection-shape-based [agentID] ; agentID = numeros de l'agent
+  ; Retourne True si on estime que l'agent est un enemi
+  ; Version naive avec shape
+  ifelse [shape] of turtle agentID = "turret" or [shape] of turtle agentID = "person soldier"
+  [
+    report true
+  ]
+  [
+    report false
+  ]
+end
+
+; Detection d'ennemi par analyse comportementale
+; C'est une decision multicriteres, chaque critere ajoutant ou reduisant les chances qu'un citizen soit un ennemi.
+;
+; Points à debattre :
+;  critères utilisés
+;  seuil
+to-report drone-detection-behavior-based [agentID] ; agentID = numeros de l'agent
+  ; Retourne True si on estime que l'agent est un enemi
+  ; Version multicriteres :
+  ;   +1 si l'ennemi est armé
+  ;   +1 si l'ennemi est proche du convoi
+  ;   +1 si l'ennemi est proche d'une montagne
+  let suspect-score 0
+  
+  ; si l'agent est armé -> il est plus probable qu'il soit aggressif
+  ; HYPOTHESE : si l'enemi agressif n'a pas d'arme il est a tort considérer comme neutre car le drone ne peut pas voir sont arme
+  if [ammo] of turtle agentID > 0
+  [
+    set suspect-score suspect-score + 1
+  ]
+
+  ; si l'agent est proche du convoi (a distance de vue) -> il est plus probable qu'il soit aggressif
+  if any? convois with [distance turtle agentID <= e-sight-radius]
+  [
+     set suspect-score suspect-score + 1
+  ]
+  
+  ; l'agent est proche d'une montagne, il tend peut être une embuscade -> il est plus probable qu'il soit aggressif
+  if any? patches with [distance turtle agentID < 3 and obstacle? = true and pzcor > 1]
+  [
+     set suspect-score suspect-score + 1
+  ]
+  
+  ;show suspect-score
+  
+  ; Si le score est >=1 on en conclut que c'est un ennemi agresif
+  ifelse suspect-score >= 1
+  [
+    report true
+  ]
+  [
+    report false
+  ]
+  
+end
+
+
+;----------
+; CITIZENS
+;----------
+to citizens-think
+  ; Marche aleatoire
+  if any? citizens with [not dead?][
+    ask citizens with [not dead?]
+    [
+      ifelse not i-am-agressive? [
+        citizen-random-move
+      ]
+      [
+        enemy-make-plan
+        execute-intentions
+      ]
+    ]
+  ]
+end
+
+to citizen-random-move
+  ; Empecher les ennemis d'entrer dans la base
+  ifelse xcor < (([pxcor] of one-of (base-patches with-max [pxcor])) + e-sight-radius) and ycor < (([pycor] of one-of (base-patches with-max [pycor])) + e-sight-radius) ;on suppose que les ennemis savent ou se trouve ma base et l'evitte
+    [
+      set heading 45
+    ]
+    [
+      ; Meme code que pour les enemis
+      rt random 30 - 15
+      
+      let counter 0
+      let infront (patch-set (patch-ahead 1) (patch-ahead 2) (patch-ahead 3))                                                                            ;while[any? ((patches in-cone 3 30) with [obstacle?]) and counter <= 10] ; non optimise
+      while[counter <= 5 and any? (infront with [obstacle?])] ; version optimisee
+        [
+          rt 5 + random 20
+          set infront (patch-set (patch-ahead 1) (patch-ahead 2) (patch-ahead 3))
+          set counter counter + 1
+        ]
+    ]
+  
+  fd-nowrap speed
+end
+
+
+;---------
+; ENEMIS
+;---------
+
+; Gestion des ennemis
+to enemies-think
+  if any? enemies with [not dead?] [
+    ask enemies with [not dead?]
+    
+    [
+      enemy-make-plan
+      execute-intentions
+    ]
+  ]
+end
+
+; Gestion des plans des ennemis
+to enemy-make-plan
+
+  ; Priorite aux drones car ils sont plus dangereux (le convoi ne peut rien faire a part fuir)
+  ; S'il y a un drone en vue on lui tire dessus
+  ifelse ammo > 0 and (ticks >= last-shot-time + e-shot-interval) and any? (fast-in-radius-nowrap (drones with [not dead? and not will-die?]) e-sight-radius) [
+    add-intention "enemy-shoot-drones" "true"
+    set last-shot-time ticks
+  ]
+  ; Sinon on va chercher les voitures du convoi
+  [
+    ; Si une voiture de convoi en vue
+    let convois-targets (fast-in-radius-nowrap convois e-sight-radius) ; Precache
+    ifelse ammo > 0 and any? convois-targets [
+      ; Optimisation: on evite de rechercher une cible (enfin verifier si elle est bien en vue) si on a encore en vue la cible qu'on avait precedemment
+      if not target? or not member? target-id ([who] of convois-targets) [
+        enemy-find-target ; On verifie qu'on peut vraiment la voir (pas d'obstacle entre l'ennemi et la voiture)
+      ]
+
+      ; Si on a une cible vraiment en vue, on lui tire dessus
+      ifelse target? [
+        let tid target-id
+        ifelse [to-protect?] of convoi tid [
+          add-intention "enemy-capture-target" "true" ; Si c'est la voiture cargaison, on la capture
+        ]
+        [
+          if ticks >= last-shot-time + e-shot-interval [
+            add-intention "enemy-shoot-target" "true" ; Sinon on tire sur la voiture
+            set last-shot-time ticks
+          ]
+        ]
+      ]
+      ; Sinon pas de voiture convoi, on marche aleatoirement
+      [
+        set target? false ; on desactive target pour signifier qu'on a perdu la cible si on en avait une avant
+        if moving? [ add-intention "enemy-random-move" "true" ]
+      ]
+    ]
+    ; Pas de convoi ni de drone en vue, on marche aleatoirement
+    [
+      set target? false ; on desactive target pour signifier qu'on a perdu la cible si on en avait une avant
+      if moving? [ add-intention "enemy-random-move" "true" ]
+    ]
+  ]
+end
+
+; Verifie qu'une voiture convoi est bien en vue (pas d'obstacle dans le champ de vision)
+to enemy-find-target
+  let found false
+  let tid nobody
+  let beam-width 0.1 ; Permet de definir la largeur du trait de patchs qu'on va checker entre l'ennemi et le convoi pour verifier s'il y a un obstacle. Une plus grande valeur = un plus large trait, donc plus de chances de tomber sur un obstacle.
+
+  ; On recupere la liste des convois dans le champ de vision (sans verifier s'il y a un obstacle)
+  let potential-targets (fast-in-radius-nowrap convois e-sight-radius) with [not finished? and not dead?]
+  ; S'il y en a, on continue
+  if any? potential-targets [
+    ask potential-targets [
+      ; Des qu'on a trouve une cible en vue, on zappe les autres
+      if not found [
+        ; On verifie si cette cible est vraiment visible sans obstacle
+        if not any? ((patches-in-between myself beam-width) with [pzcor = solAlt and obstacle?]) [
+          ; Si c'est le cas c'est bon!
+          set tid [who] of self ; on memorise l'id
+          set found true ; et on active le critere d'arret
+          stop ; on sort du ask car ca ne sert a rien de tester les autres cibles
+        ]
+      ]
+    ]
+;    let list-of-potential-target-id [who] of potential-target
+;    let i 0
+;    while [i < N and stp = 0] [
+;      let potential-target-id item i list-of-potential-target-id
+;      let Xl [xcor] of convois with [who = potential-target-id]
+;      let Yl [xcor] of convois with [who = potential-target-id]
+;      let X item 0 Xl
+;      let Y item 0 Yl
+;      facexy X Y
+;      let dist distancexy X Y 
+;      let potential-obstacle patches in-cone dist 10
+;      ifelse any?  potential-obstacle with [obstacle? = false and pzcor > 0] [
+;        set target? false
+;        set stp 1
+;      ]
+;      [
+;        set target? true
+;        set target-id potential-target-id
+;        set found true
+;      ]
+;      set i i + 1
+;    ]
+  ]
+  
+  ; Fin de la procedure, on retourne ce qu'on a (en memorisant dans des variables globales au lieu de report)
+  ifelse found [
+    set target? true
+    set target-id tid
+  ]
+  [set target? false]
+end
+
+; Tire sur un drone en vue
+to enemy-shoot-drones
+  let target one-of fast-in-radius-nowrap (drones with [not dead? and not will-die?]) e-sight-radius ; attention il faut un radius suffisamment grand (>= hauteAlt) pour detecter les drones en haute altitude!
+  if target != nobody [
+    set ammo ammo - 1
+
+    ifelse random-float 1 < precision-enemies
+    [
+      shoot-missile-towards target task[ask my-target [drone-kill]]
+      ask target [ set will-die? true ]
+    ]
+    [ shoot-missile-towards target "missed" ]
+  ]
+end
+
+; Tire sur une voiture convoi deja ciblée avec enemy-find-target
+to enemy-shoot-target
+  set ammo ammo - 1
+
+  let tid target-id
+  let current-target convoi tid
+  face current-target
+  ifelse random-float 1 < precision-enemies
+  [
+    shoot-missile-towards current-target task[ask my-target [convoi-kill]]
+    set target? false ; plus de cible puisqu'on vient de la tuer! IMPORTANT car permet a l'ennemi de passer a une autre cible (il peut ainsi enchainer les cibles...)
+  ]
+  [ shoot-missile-towards current-target "missed" ]
+end
+
+; Capture la voiture cargaison
+; TODO: pour l'instant on la tue, il faut la capturer plutot et faire un game-over!
+to enemy-capture-target
+  let tid target-id
+  let current-target convoi tid
+  face current-target
+  fd 2
+  if distance-nowrap current-target < 1 [
+    ask current-target [
+      convoi-kill
+    ]
+    set target? false ; plus de cible puisqu'on vient de la tuer! IMPORTANT car permet a l'ennemi de passer a une autre cible (il peut ainsi enchainer les cibles...)
+  ]
+end
+
+; Deplacement aleatoire d'un ennemi, en faisant attention a ne pas aller dans un obstacle!
+to enemy-random-move
+  ; Empeche les ennemis de rentrer dans la base
+  ifelse xcor < (([pxcor] of one-of (base-patches with-max [pxcor])) + e-sight-radius) and ycor < (([pycor] of one-of (base-patches with-max [pycor])) + e-sight-radius) ;on suppose que les ennemis savent ou se trouve ma base et l'evitte
+  [
+    set heading 45
+  ]
+  [
+    
+    ; On se tourne aleatoirement histoire de vraiment se promener (mais avec un certain angle maximum, sauf si obstacle)
+    rt random 30 - 15
+    
+    ; On continue de tourner tant qu'il y a un obstacle devant nous, avec une limite sur le nombre de ticks pour ne pas perdre trop de temps
+    let counter 0
+    let infront (patch-set (patch-ahead 1) (patch-ahead 2) (patch-ahead 3)) ; precache
+                                                                            ;while[any? ((patches in-cone 3 30) with [obstacle?]) and counter <= 10] ; non optimise
+    while[any? (infront with [obstacle?]) and counter <= 5] ; optimise
+    [
+      rt 5 + random 20
+      set infront (patch-set (patch-ahead 1) (patch-ahead 2) (patch-ahead 3))
+      set counter counter + 1
+    ]
+  ]
+
+  ; Avance
+  fd-nowrap speed
+end
+
+to enemy-kill 
+  set dead? true
+  set color red
+  set size 3
+  set shape "fire"
+end
+
+
+;-----------
+; MISSILES
+;-----------
+; Gere la creation, le deplacement et l'appel de la fonction callback (la fonction qui va tuer ou faire ce qu'on veut a la cible lorsque le missile touche la cible) pour les missiles
+; NOTE: ne gere pas directement la mort de la cible, c'est la fonction callback qui doit s'en charger (les missiles ne sont donc pas necessaires en termes de fonctionnalites mais seulement de visuel et de realisme).
+
+; Tir d'un missile
+; Cette procedure va creer un nouvel objet missile et lui assigner les parametres qu'il faut
+to shoot-missile-towards [target callback] ; target est l'agent qui sera la cible ; callback est une task qui va gerer la mort de l'agent target (ou ce qu'on veut d'autre)
+  ; Si on veut cacher les missiles, on va appeler tout de suite la fonction callback comme ca pas de missile a gerer (beaucoup plus rapide = optimisation)
+  ifelse hide-missiles [
+    ; Si le missile rate sa cible, alors on ne fait rien
+    ; Sinon on tue la cible
+    if callback != "missed" [
+      ; On doit creer un missile quand meme pour pouvoir appeler la fonction callback
+      hatch-missiles 1 [ ; mais pas besoin des variables comme speed ou maxturn ici!
+        hide-turtle
+        ; On set les variables qu'il faut
+        set my-target target
+        set callback-func callback
+        set my-timeout ticks + 100 ; juste une valeur au pif...
+        ; Appelle la fonction callback qui va gerer la mort de la cible
+        run callback-func
+        ; On tue le missile
+        die
+      ]
+    ]
+  ]
+  ; Sinon on veut afficher les missiles
+  [
+    ; On cree un missile, juste au meme endroit que l'agent qui le cree (grace a hatch il y a heritage des parametres du parent)
+    hatch-missiles 1 [
+      ; Init de la visu
+      set shape "triangle" ; triangle possede un modele 3D
+      set size 0.5 ; plus petit que 1.0 pour pouvoir voir la cible en slow-mo
+      set color grey
+      if callback != "missed" [ set color white ] ; si le missile va toucher sa cible, on le colorie en blanc pour montrer ca
+      if hide-missiles [ hide-turtle ]
+
+      ; Init de la position et de l'angle
+      ;move-to [patch-ahead 1] of ([towards-nowrap target] of myself) ; inherit position already with hatch
+      face-nowrap target
+      set pitch 0
+      set roll 0
+
+      ; Init des variables
+      set speed 0.1 * simu-speed ; vitesse au moins aussi rapide que les drones (sauf si on veut implementer dans les drones des manoeuvres de vrille pour esquiver les missiles)
+      set maxturn 20 * simu-speed
+      set my-target target ; on memorise la cible de ce missile
+      set callback-func callback ; on memorise la fonction a rappeler a la fin pour gerer la mort de la cible (sauf si le missile va manquer sa cible alors callback-func = "missed")
+      set my-timeout ticks + 2 * ([distance-nowrap myself] of my-target) / speed ; timeout: si au bout de deux fois le temps necessaire au missile pour atteindre sa cible, le missile ne l'a toujours pas atteint, alors on le timeout (on active sa fonction callback comme s'il avait touche son but)
+
+      ; Slow-motion mode: si le missile va toucher sa cible alors on le suit
+      if slow-mo and callback != "missed" [ follow-me ]
+    ]
+  ]
+end
+
+; Procedure principale de gestion des missiles apres qu'ils soient cree (boucle qui sera appelee dans le go/main)
+to missiles-think
+  if any? missiles [
+    ; Pour chaque missile
+    ask missiles [
+      ; On le fait avancer vers sa cible
+      move-missile
+      ; Slow-motion mode: on ralentit un peu le temps de rafraichissement pour avoir le temps de voir ce qu'il se passe avec le missile (sinon il est trop rapide!)
+      if slow-mo and subject = self [ display wait 0.05 ]
+
+      ; Si on a atteint la cible
+      if distance-nowrap my-target < 1 or ticks >= my-timeout [
+        ; Si ce missile est fait pour toucher, alors on va tuer la cible
+        ifelse callback-func != "missed"
+        [
+          ; Appelle la fonction de rappel (callback) qui va gerer la mort de l'agent target
+          run callback-func
+          ; Slow-motion: on reset la camera
+          if slow-mo and subject = self [ reset-perspective ]
+          ; On detruit le missile
+          die
+        ]
+        ; Sinon ce missile est fait pour manquer sa cible, alors on va faire continuer le missile un peu sur sa trajectoire mais plus loin que la cible pour bien montrer qu'il a manque sa cible
+        [
+          ; On cherche un patch sur la meme hauteur mais plus loin, et on en fait notre nouvelle target
+          let oldpitch pitch
+          set pitch 0
+          set my-target patch-ahead (3 + random 10) ; au moins 3 patchs plus loin pour bien manquer qu'on a rate
+          set pitch oldpitch
+
+          ; On utilise une fonction de rappel vide de facon a ce que ca ne fasse rien quand on arrive sur le patch de destination (mais ce ne sera pas "missed" donc on ne va pas relancer encore la recherche d'un autre patch)
+          set callback-func task[]
+        ]
+      ]
+    ]
+  ]
+end
+
+; Deplacement d'un missile avec un angle et pitch limite pour plus de realisme
+to move-missile
+  let maxpitch 10
+
+  ; Correction de l'angle de rotation
+  let newheading towards-nowrap my-target
+  let dirCorrection subtract-headings newheading heading
+  set dirCorrection limit-range maxturn dirCorrection
+  
+  rt dirCorrection
+
+  ; Correction du pitch
+  let newpitch towards-pitch-nowrap my-target
+  let pitchCorrection subtract-headings newpitch pitch
+  set pitchCorrection limit-range maxpitch pitchCorrection
+
+  ; Et on y va!
+  set roll 0
+  tilt-up pitchCorrection
+  fd speed
+end
+
+
+;-----------
+;  CONVOIS
+;-----------
+
+; Procedure principale de gestion des convois
+to convois-think
+
+  if n-cars > 0 [
+
+    let first-car min [who] of convois
+
+    ; Calcul du plan AStar pour chaque leader si necessaire
+    foreach sort-on [who] turtle-set convois with [leader? and not finished? and not dead?] [
+      let id ([who] of ?) - first-car
+      ; Recalcule le chemin si nécessaire (par exemple au début de la simulation ou quand le convoi se sépare)
+      ; Note: on est oblige de le faire en dehors du ask sinon on ne peut pas acceder a tous les patchs
+      if empty? as-path or length as-path < (id + 1) or empty? (item id as-path) [ ; s'il n'y a pas encore de chemin du tout, ou pas de chemin pour cette voiture, on cree un plan AStar
+        ; Cree le plan AStar (attention a ca que le patch start soit au niveau ou il y a les obstacles, ici pzcor = mapAlt pour les obstacles)
+        let start-patch min-one-of (patches with [pzcor = mapAlt and not obstacle?]) [distance ?] ; on s'assure de choisir comme patch de depart un patch libre sans obstacle, sinon quand on split un convoi il se peut qu'il soit sur un obstacle et qu'il ne puisse jamais generer de chemin
+        let new-path plan-astar ([patch-at 0 0 (pzcor * -1)] of start-patch) (one-of patches with [objectif?]) ([genlongpath?] of ?)
+        ; S'il n'y a pas de plan et qu'on a essayé de trouver un long chemin, on attend la prochaine iteration et on reessaie mais avec un plan court
+        if empty? new-path and [genlongpath?] of ? [ ask ? [ set genlongpath? false ] ]
+        ; S'il n'y a pas deja une entree pour cette voiture on la cree
+        ifelse length as-path < (id + 1) [
+          set as-path lput new-path as-path
+        ]
+        ; Sinon on remplace l'entree pour cette voiture par le nouveau plan
+        [
+          set as-path replace-item id as-path new-path
+        ]
+      ]
+    ]
+    
+    ; Deplacement des leaders sur le chemin AStar
+    ask convois with [leader? and not finished? and not dead?] [ ; Tant qu'on n'a pas atteint le but
+      ;move-convoi-naive ; deplacement naif sans AStar
+
+      ; Recupere le plan AStar
+      let my-as-path item (who - first-car) as-path
+      if not empty? my-as-path [
+        ; Deplacement par waypoints: on se deplace jusqu'au prochain patch du chemin jusqu'à l'atteindre
+        let next-patch first my-as-path
+        let zz pzcor
+        set next-patch [patch-at 0 0 (zz - pzcor)] of next-patch ; mise a niveau de pzcor au cas ou le chemin a ete calculé sur un autre plan
+        ; Deplacement vers le prochain waypoint
+        if next-patch != patch-here [move-convoi next-patch false false]
+        ; Si on a atteint ce patch, on le supprime de la liste, et on va donc continuer vers le prochain patch du chemin
+        if patch-here = next-patch [
+          set my-as-path remove-item 0 my-as-path
+          set as-path replace-item (who - first-car) as-path my-as-path
+          if debug [ show (word "Waypoint atteint: " patch-here ", prochain: " next-patch ) ]
+        ]
+      ]
+
+      ; Critere d'arret: on est a cote de l'objectif
+      check-convoi-finished
+
+      ; Envoi de messages aux drones
+      if not no-wifi [ convoi-send-messages ]
+    ]
+    
+    ; Deplacement des voitures-cortege: elles ne font que suivre la voiture devant eux (avec laquelle elles sont liées)
+    ask convois with [not leader? and not finished? and not dead?] [
+      ifelse any? my-out-convoi-links [
+        move-convoi ([patch-here] of one-of out-convoi-link-neighbors) true true
+      ]
+      ; S'il n'y a pas de lien devant, c'est probablement que la voiture est morte, donc on devient leader
+      [
+        set leader? true
+        set genlongpath? true
+        if not to-protect? [ set color orange ]
+      ]
+    ]
+  ]
+end
+
+; Mort d'une voiture du convoi: active la variable dead? (la voiture ne bougera plus), la colorie en rouge et casse ses liens avec les autres voitures (pour qu'elles recalculent leurs propres itinéraires)
+to convoi-kill
+  set dead? true
+  set color red
+  ask my-out-convoi-links [die]
+  ask my-in-convoi-links [die]
+  if to-protect? [
+    set color white
+    set mission-failed? true
+    user-message "MISSION ECHOUEE: La voiture cargaison a ete capturee!"
+  ]
+end
+
+; Avancer une voiture naivement (sans AStar mais en essayant d'eviter les obstacles. Marche tres mal!)
+to move-convoi-naive
+  move-convoi (one-of patches with [objectif? = true]) false false
+  let any-obstacle? detect-obstacle
+  while [any-obstacle?] [ turn-away set any-obstacle? detect-obstacle ]
+  set pitch 0
+end
+
+to-report detect-obstacle
+ if any? other patches in-cone 10 60 with [obstacle?] [report true]
+; if any? other patches in-cone 10 90 [report true]
+; if any? other patches in-cone 3 270 [report true]
+ report false 
+end   
+
+to turn-away
+   ;let free-patches neighbors with [not any? patches ]
+   ;if any? free-patches [face one-of free-patches]
+   rt random 10 - 5
+end
+
+to check-convoi-finished
+  ; Critere d'arret: on est a cote de l'objectif
+  ; Note: on veut etre a cote de l'objectif et pas directement dessus car on est une voiture, donc il se peut qu'on tourne indefiniment autour sans arriver directement a arriver dessus a cause de la limite d'angle de rotation.
+  if any? [neighbors6-nowrap with [objectif?]] of patch-here [ ; On ne bouge pas si on est arrive au but!
+                                                               ; Fini pour le leader
+    set finished? true
+    ; Fini aussi pour toutes les voitures-cortege qui suivent ce leader
+    let linked-cars (list in-convoi-link-neighbors)
+    while [not empty? linked-cars] [ ; on fait une boucle pour recursivement mettre a finished? = true toutes les voitures liees entre elles dans ce cortege
+      let next-linked-cars []
+      foreach linked-cars [
+        ask ? [
+          set finished? true
+          if any? in-convoi-link-neighbors [ ; on recupere les voitures-cortege liees a la voiture-cortege en cours
+            set next-linked-cars lput in-convoi-link-neighbors next-linked-cars
+          ]
+        ]
+      ]
+      set linked-cars next-linked-cars
+    ]
+  ]
+end
+
+; Avancer une voiture
+; Permet de faire avancer les voitures d'un convoi (cortege et leader)
+; Maintien egalement une petite distance afin de ne pas "rentrer" dans la voiture de devant
+to move-convoi [goal slowdown? cortege?]
+  ;show (word "ici:" patch-here " goal:" goal)
+
+  ; Calcule de l'angle avec la cible
+  let headingFlag heading
+  ifelse cortege?
+  [ set headingFlag (towards goal) ] ; Si c'est un cortege, on veut qu'il suive toujours le leader par le chemin le plus court (surtout en play-mode ou le joueur n'est pas limite par le nowrap)
+  [ set headingFlag (towards-nowrap goal) ]
+  let dirCorrection subtract-headings headingFlag heading
+  ; Arrondissement de l'angle (on ne veut pas faire de micro tournant)
+  set dirCorrection precision dirCorrection 2
+  ; Limite de l'angle, pour que ce soit plus realiste (la voiture ne peut pas faire un demi-tour sur place!)
+  ifelse dirCorrection > maxdir [ ; limite a droite
+    set dirCorrection maxdir
+  ]
+  [
+    if dirCorrection < maxdir * -1 [ ; limite a gauche
+      set dirCorrection maxdir * -1
+    ]
+  ]
+
+  ; On tourne
+  rt dirCorrection
+
+  ; Limite de vitesse pour les voitures-cortege (pour pas qu'elles ne rentrent dans la voiture leader)
+  let tmp-speed speed
+  if slowdown? [
+    if distance-nowrap goal < 1.1 [
+      set tmp-speed tmp-speed / 20
+    ]
+    if distance-nowrap goal < 0.9 [
+      set tmp-speed 0
+    ]
+  ]
+
+  ; Deplacement!
+  set pitch 0 ; make sure there's no pitch ever, else the car will disappear in the ground  
+  fd tmp-speed ; Avance
+end
+
+; Plannification AStar d'un patch start vers un patch goal
+; Note: si l'heuristique est consistante/monotone (comme distance euclidienne/vol d'oiseau), h = 0 revient a faire Djikstra
+; Note2: on l'utilise avec le convoi mais on peut l'utiliser avec n'importe quel agent, c'est generique.
+; Note3: limite en 2D pour cette application mais on peut facilement la modifier pour accepter la 3D (enlever les limites with [pzcor ...])
+to-report plan-astar [start goal longpath?] ; start et goal sont des patchs
+
+  ; Desactivation du refresh GUI (car calculs internes): Pour etre plus rapide, on dit a NetLogo qu'il peut calculer toute cette fonction sans avoir a updater le GUI (que des calculs internes), comme ca le slider de vitesse n'influencera pas la vitesse de ce code (sinon en slower ca met vraiment beaucoup de temps)
+  if not debug-more [no-display]
+
+  ; INIT
+  ; Ajustement du niveau du but par rapport au start, car le plan est en 2D ici
+  let start-pzcor [pzcor] of start
+  set goal [patch-at 0 0 ([pzcor] of start - [pzcor] of goal)] of goal
+
+  ; (Re)init des variables AStar sur tous les patchs
+  ;let closed n-values world-height [n-values world-width [0]]
+  ask patches [
+    set as-closed 0 ; sert a savoir si ce patch a deja ete visite. 0 = non visite, 1 = deja visite (et on visite en premier par le chemin optimal comme Djikstra, donc si un noeud a deja ete visite, on est sur qu'il est inutile de le revisiter par un autre chemin puisqu'il sera moins optimal que le premier chemin qui a conduit a ce patch - ceci est assure car on utilise la distance euclidienne a vol d'oiseau qui est une heuristique consistante/monotone, pas juste admissible)
+    set as-heuristic astar-faster * distance-nowrap goal ; si astar-faster > 1 alors on utilise Weighted AStar, ou le chemin est suboptimal avec une limite de cout au plus astar-faster fois supérieur au cout du chemin optimal. (eg: astar-faster = 2 signifie que le chemin sera au pire deux fois moins optimal au pire). Note: si astar-faster = 0 alors h = 0 pour tous les patchs et ca revient à l'algo de Dijkstra.
+  ]
+  
+  ; Init de l'algo en utilisant le patch de depart
+  let pos start
+  let h [as-heuristic] of start
+  let g 0
+  let f (g + h)
+
+  ; Init de la liste open (la liste des patchs a explorer) du type [f, g, h, position du patch]
+  let open (list (list f g h pos))
+
+  ; Init des criteres d'arret
+  let found false ; si un chemin a ete trouve
+  let resign false ; si aucun chemin ne peut etre trouve (plus rien dans la liste open)
+  let counter 0 ; si on a visite trop de patchs et que la recherche met trop de temps
+
+  while [not found and not resign] [
+    
+    ; Critere d'arret si echec (plus de patch a visiter ou trop de patchs deja visite)
+    ifelse empty? open or (astar-max-depth > 0 and counter > astar-max-depth) [
+      set resign true
+    ]
+    [
+      ; Incremente le counter
+      set counter counter + 1
+
+      ; On reorganise la liste open pour toujours visiter le meilleur patch candidat en premier (celui qui maximise f)
+      set open sort-by [item 0 ?1 < item 0 ?2] open
+      ; Cas particulier: on visite le plus mauvais patch, celui qui minimise f, pour maximiser la longueur du chemin (cool pour tester les drones car l'environnement reste relativement petit)
+      if astar-longpath or longpath? [set open reverse open]
+      ; Autre cas particulier: on visite le chemin au hasard, permet aussi de construire un long chemin (mais moins long) et plus rapidement. C'est un compromis entre l'optimal et la longueur.
+      if astar-randpath [set open shuffle open]
+
+      ; Pop un element de la liste, le meilleur candidat
+      let next first open
+      set open but-first open
+      set pos item 3 next
+      set g item 1 next
+
+      ; Dessin en live du chemin parcouru par astar
+      if debug-more [
+      wait 0.01
+      ask pos [ set pcolor red ]
+      ]
+
+      ; Critere d'arret si reussite: on est sur le but donc on a trouve un chemin
+      ifelse pos = goal [
+        set found true
+      ]
+      ; Sinon on va explorer les voisins du patch en cours
+      [
+        ; Expansion du meilleur candidat (expansion = on ajoute les voisins dans la liste open, des noeuds a visiter)
+        ask [neighbors6-nowrap with [pzcor = start-pzcor and as-closed = 0 and not obstacle? and not base?]] of pos [ ; On ne visite que les voisins au meme niveau (astar en 2D, mais on peut etendre ici au 3D facilement!) ET on ne l'a pas deja visite (as-closed = 0) ET il n'y a pas d'obstacle sur ce patch
+          ; Calcul du score f de ce voisin
+          let g2 g + as-cost
+          let h2 as-heuristic
+          let f2 g2 + h2
+
+          ; Ajout dans la liste open des patchs a visiter
+          set open lput (list f2 g2 h2 self) open
+
+          ; Ajout des meta-donnees sur ce patch
+          ;set as-closed min (list ((as-closed + 1) ([as-closed] of pos + 1)) ; Pas necessaire car on est sur qu'on ne visite qu'une fois un noeud dans open, ensuite on lui attribue un nombre dans closed et donc on ne l'ouvrira plus jamais
+          set as-closed ([as-closed] of pos + 1) ; pour savoir que ce patch a deja ete visite + faire astar-visu-more
+          set as-prev-pos pos ; pour backtracker ensuite et trouver le chemin qui mene au but
+        ]
+      ]
+    ]
+  ]
+
+  if debug [print (word "found:" found " - resign:" resign)]
+
+  ; Visualisation de tous les noeuds explores en coloriant selon quand ca a ete explore (score as-closed)
+  if astar-visu-more [
+    let max-closed max [as-closed] of patches with [pzcor = start-pzcor] ; Récupère la valeur tdval max entre tous les patchs
+    let min-closed min [as-closed] of patches with [pzcor = start-pzcor] ; Idem pour min tdval
+    if (max-closed != min-closed) [ ; Si on a au moins appris quelquechose (sinon tous les patchs auront la même couleur, ce n'est pas intéressant)
+      ask patches with [pzcor = start-pzcor] [
+        if debug [set plabel precision as-closed 1]
+        set pcolor (61 + ((as-closed - min-closed) / (max-closed - min-closed)) * 9 )
+      ]
+    ]
+  ]
+
+  ; Extraction du chemin par marche inverse, depuis le goal vers start (grace a as-prev-pos qui memorise depuis quel patch on est arrive a celui en cours, et donc le chemin le plus court puisque l'algo garantie que la premiere exploration est toujours optimale)
+  let path []
+  if not resign [
+    ; On commence du but, goal
+    set pos goal
+    set path lput pos path
+
+    ; Pour la visualisation du chemin, init du premier waypoint
+    if astar-visu [
+      if any? waypoints [
+        ask waypoints [ die ]
+      ]
+      create-waypoints 1 [ hide-turtle move-to [patch-at 0 0 1] of goal ]
+    ]
+
+    ; Tant qu'on a pas reconstruit tout le chemin vers le debut, start
+    ; On va a chaque fois recuperer le noeud parent avec as-prev-pos
+    while [pos != start] [
+
+      ; Visualisation du chemin, on ajoute un lien entre le parent et le noeud en cours
+      if astar-visu [
+        create-waypoints 1 [ hide-turtle move-to [patch-at 0 0 1] of ([as-prev-pos] of pos)
+          create-path-link-to one-of waypoints-on [patch-at 0 0 1] of pos [
+            set color red
+            show-link
+          ]
+        ]
+      ]
+
+      ; Construction inverse du chemin, on ajoute le noeud parent dans le chemin et on va l'explorer
+      ;set pos [min-one-of neighbors6-nowrap [as-closed]] of pos
+      set pos [as-prev-pos] of pos
+      set path lput pos path
+    ]
+
+    ; Chemin construit, on inverse la liste pour qu'elle soit de start a goal au lieu de l'inverse
+    set path reverse path
+    set path but-first path ; on enleve le premier patch, qui est celui sur lequel on est deja
+  ]
+
+  ; Reactivation du refresh GUI
+  display
+
+  ; Et on retourne le chemin complet (ou une liste vide si on n'a rien trouve)
+  report path
+end
+
+; Scinde un convoi en deux
+to split-convoi
+  if any? convois with [not leader?] [
+    ask one-of convois with [not leader?] [
+      ask my-out-convoi-links [ die ]
+      set leader? true
+      set genlongpath? true ; force le nouveau convoi a se dispatcher sur un autre chemin totalement different
+      ifelse not to-protect? [
+        set color orange
+      ]
+      [
+        set color yellow + 3
+      ]
+    ]
+  ]
+end
+
+
+;---------
+; DRONES
+;---------
+; Communication note: voir la procedure drone-send-messages pour rajouter des croyances partagees entre les drones, 
+
+; Procedure principale de gestion des drones
+to drones-think
+  ask drones [
+    ; Tant que le drone n'est pas mort (plus de fuel ou abattu par un ennemi)
+    if not dead? [
+      set fuel fuel - fuel-dec ; on decroit le fuel a chaque tick
+      
+      drones-check-needs
+      
+      drone-send-messages
+      
+      drone-receive-messages
+
+      if empty? get-intentions
+      [
+        drone-detect-enemies
+        if empty? get-intentions [
+          ; On patrouille / explore l'environement
+          ifelse debug
+          [drone-choose-plan-debug-GUI] ; la stratégie des drones est celle de l'interface
+          [drone-choose-plan]
+        ]
+      ]
+
+      execute-intentions
+
+      if d-scatter-solve1 and (empty? get-intention or (intention-name get-intention) = "drone-landing" or (intention-name get-intention) = "drone-take-off") [ CPS-algorithm ]
+
+      ; Plus de fuel, le drone est mort
+      if fuel < 0 [
+        drone-kill
+      ]
+    ]
+  ]
+end
+
+; Choisit un plan a appliquer pour les drones
+to drone-choose-plan
+
+  ; Priorité: on attaque les ennemis
+;  let enemies-to-attack-requests filter [get-belief-content ? = true] (beliefs-of-type "hq-ask-attack-enemy")
+;  let IDenemies []
+;  if not empty? enemies-to-attack-requests [
+;    set IDenemies map [read-from-string get-belief-key ?] enemies-to-attack-requests
+;     
+;  ]
+;  let enemies-to-attack turtle-set nobody
+;  if not empty? IDenemies [
+;    set enemies-to-attack (turtle-set enemies citizens) with [member? who IDenemies and not dead?]
+;  ]
+;  
+;  if any? enemies-to-attack and d-group-attack > 1 [
+;    set enemies-to-attack (turtle-set enemies citizens) with [member? who IDenemies and not dead?]
+;  ]
+
+  let reinforcement-requests sort-by [get-belief-timestamp ?1 > get-belief-timestamp ?2] beliefs-of-type "reinforcement-request" ; latest requests = more urgent
+  ; Filter out terminated requests
+  set reinforcement-requests filter [get-belief-content ? != false] reinforcement-requests
+  ; Filter out requests about agents that are already dead
+  set reinforcement-requests filter [[not dead? and not will-die?] of turtle (read-from-string (get-belief-key ?))] reinforcement-requests
+  ; Filter requests made by drones that are dead. We also remove requests that this drone itself made (since it will eventually receive its own requests by wifi relay from other drones)
+  set reinforcement-requests filter [[not dead? and not will-die? and not (self = myself)] of drone get-belief-original-sender ?] reinforcement-requests
+
+  ; Si on est dispo
+  ; On repond a l'auteur du message pour lui dire que c'est bon pour nous!
+  ; Ensuite on se dirige vers lui pour se regrouper
+  if not empty? reinforcement-requests and empty? intentions [
+    let req item 0 reinforcement-requests
+    let author drone get-belief-original-sender req
+    let enemyID read-from-string get-belief-key req
+    show (word "Available for reinforcement request of " author)
+    wimax-send (turtle-set author) "reinforcement-ok" (list enemyID who) true
+
+    ; Condition de fin par timelimit
+    let cond-timelimit task[false] ; Par defaut il n'y a pas de timelimit
+    if strategy-timelimit > 0 [ ; Si un timelimit a ete fait, on va utiliser une task pour verifier si le timelimit est depasse
+      set strategy-begin-time ticks
+      set cond-timelimit task[ifelse-value (ticks >= strategy-begin-time + strategy-timelimit) [true][false]]
+    ]
+
+    ; Se regrouper avec le drone appelant a renforcement jusqu'a ce que l'ennemi soit mort
+    ; (En gros on fait semblant de faire un tir groupé, en vrai le tir n'est fait que par un seul agent - mais c'est implémentable, c'est juste qu'on n'a pas fait de système de points de vie donc un missile ca tue a tous les coups sauf si ca rate la cible)
+    add-intention task[move-drone-towards author] task[([dead? or will-die?] of turtle enemyID) or ([dead? or will-die?] of author) or runresult cond-timelimit]
+    stop
+  ]
+
+
+  ; Si on ne sait pas ou se trouve le convoi, on cherche au hasard jusqu'a ce qu'on tombe sur soit le convoi, soit sur un autre drone qui sait ou se trouve le convoi (et qui nous relayera automatiquement l'info)
+  ; Note: Ce cas arrive quand on a la position du convoi, mais qu'on l'a perdu de vue (par exemple pour aller se recharger a la base) et quand on revient a la derniere position connue du convoi celui-ci n'est plus la. A ce moment la, move-drone-to-convoi va automatiquement supprimer cette croyance car elle n'est plus coherente avec le monde.
+  ifelse n-cars <= 0 or (not no-wifi and not exist-beliefs-of-type "pos-convoi")
+  [
+    set current-exploration-plan 4
+    add-intention "drone-strategy-random-exploration" task[true] ; task[true] is a 100x faster than "true". NOTE: careful: ask turtle 0 [ let a [who] show runresult a ] => won't work! You must use: let a task[who] ...
+    stop
+  ]
+
+  ; Sinon on sait ou est le convoi, on va alors choisir une strategie
+  [
+    ; Condition de fin par timelimit
+    let cond-timelimit task[false] ; Par defaut il n'y a pas de timelimit
+    if strategy-timelimit > 0 [ ; Si un timelimit a ete fait, on va utiliser une task pour verifier si le timelimit est depasse
+      set strategy-begin-time ticks
+      set cond-timelimit task[ifelse-value (ticks >= strategy-begin-time + strategy-timelimit) [true][false]]
+    ]
+
+    ; Condition de fin normale (but de la procedure atteint)
+    let cond-end task[true] ; Par defaut on met a true, ca veut dire que l'intention ne sera executee qu'une seule fois puis on va choisir une autre strategie
+
+    ; Strategie de suivi du convoi (ou de rapprochement si on est loin)
+    if not any? other drones with [current-exploration-plan = 1] ; il faut qu'il y ait toujours un drone qui suive le convoi
+    [
+      set current-exploration-plan 1
+      ifelse not no-wifi
+      [ add-intention "move-drone-to-convoi" task[(runresult cond-timelimit) or (runresult cond-end)] ] ; fin de l'intention/strategie soit par timelimit s'il y en a un, soit par la condition de fin normale (but atteint)
+      [ add-intention "move-drone-to-convoi-nowifi" task[true] ]
+      stop ; on n'evalue pas les autres strategies, on a deja choisi
+    ]
+
+    ; Strategie d'exploration du chemin du convoi en amont
+    if not any? other drones with [current-exploration-plan = 2]
+    [
+      ; Path ahead strategy using the Astar path
+      ifelse not play-mode-enabled? [
+        set current-exploration-plan 2 
+        set cond-end task[ empty? my-plan ]
+        add-intention "drone-strategy-astar-ahead-exploration" task[(runresult cond-timelimit) or (runresult cond-end)]
+      ]
+      ; In play-mode, there's no Astar path since it's a player controlling the convoy, thus we use the scout forward
+      [
+        ; Note: commented out because it's not a good strategy: we prefer to have the drones keep hanging around the player, not go away do some stuff and then lose the position of the player (and risk being killed for nothing!)
+        ;  drone-scout-forward false
+        set current-exploration-plan 4
+        let curtime ticks
+        set cond-end task[ifelse-value (ticks >= curtime + 2)[true][false]] ; tricks: on met une petite duree de repetition de l'intention avec un timelimit pour forcer l'affichage de l'intention avec show-intentions (sinon avec task[true] l'intention est tout de suite supprimee apres l'execution, pas le temps de la voir!)
+        set circular-radius-random (random radius-circular-strategy) - floor (radius-circular-strategy / 2)
+        add-intention "drone-strategy-circular-exploration" task[(runresult cond-timelimit) or (runresult cond-end)]
+      ]
+      stop
+    ]
+
+    ; Par defaut, si je fais rien -> on reste a proximite du convoi en tournoyant autour
+    set current-exploration-plan 4
+    let curtime ticks
+    set cond-end task[ifelse-value (ticks >= curtime + 2)[true][false]] ; tricks: on met une petite duree de repetition de l'intention avec un timelimit pour forcer l'affichage de l'intention avec show-intentions (sinon avec task[true] l'intention est tout de suite supprimee apres l'execution, pas le temps de la voir!)
+    set circular-radius-random (random radius-circular-strategy) - floor (radius-circular-strategy / 2)
+    add-intention "drone-strategy-circular-exploration" task[(runresult cond-timelimit) or (runresult cond-end)]
+    stop
+  ]
+end
+
+; Permet de forcer le choix de strategie des drones depuis le GUI
+to drone-choose-plan-debug-GUI
+  ; Pas de prérequi pour l'exploration aleatoire
+  if exploration-strategy = "random-move"
+  [
+    add-intention "drone-strategy-random-exploration" "true"
+  ]
+  
+  ; Pour les autres startégies, il est nécéssaire de connaitre la position du convoi
+  ifelse exist-beliefs-of-type "pos-convoi"
+  [
+    ; Condition de fin par timelimit
+    let cond-timelimit task[false] ; Par defaut il n'y a pas de timelimit
+    if strategy-timelimit > 0 [ ; Si un timelimit a ete fait, on va utiliser une task pour verifier si le timelimit est depasse
+      set strategy-begin-time ticks
+      set cond-timelimit task[ifelse-value (ticks >= strategy-begin-time + strategy-timelimit) [true][false]]
+    ]
+
+    ; Condition de fin normale (but de la procedure atteint)
+    let cond-end task[true] ; Par defaut on met a true, ca veut dire que l'intention ne sera executee qu'une seule fois puis on va choisir une autre strategie
+    
+    if exploration-strategy = "circular-move"
+    [
+      let bel read-first-belief-of-type "pos-convoi"
+      let pos-convoi get-belief-content bel
+      ifelse not ([manhattan-distance2d pos-convoi] of patch-here <= wifi-coverage-radius)
+      [
+        add-intention "move-drone-to-convoi" task[(runresult cond-timelimit) or (runresult cond-end)]
+      ]
+      [
+        let curtime ticks
+        set cond-end task[ifelse-value (ticks >= curtime + 2)[true][false]] ; tricks: on met une petite duree de repetition de l'intention avec un timelimit pour forcer l'affichage de l'intention avec show-intentions (sinon avec task[true] l'intention est tout de suite supprimee apres l'execution, pas le temps de la voir!)
+        add-intention "drone-strategy-circular-exploration" task[(runresult cond-timelimit) or (runresult cond-end)]
+      ]
+    ]
+    if exploration-strategy = "astar-move"
+    [
+      set cond-end task[ empty? my-plan ]
+      add-intention "drone-strategy-astar-ahead-exploration" task[(runresult cond-timelimit) or (runresult cond-end)]
+    ]
+  ]
+  [
+    add-intention "drone-strategy-random-exploration" "true"
+  ]
+end
+
+; Exploration en amont du convoi du chemin plannifié. Permet de vérifier qu'il n'y a pas d'ennemis sur le chemin avant que le convoi ne l'emprunte.
+; Note: On ne suit pas exactement le chemin astar mais on reste a proximite
+to drone-strategy-astar-ahead-exploration
+  ; On récupère le plan d'un des leaders.
+  ; Note: on pourrait le faire communiquer par wifi par le convoi, mais ca reviendrait exactement au meme, ou on peut considérer que les drones connaissent deja le chemin avant que la mission ne commence, ca fait partie des specifications de la mission. Dans tous les cas c'est pareil, on n'a pas besoin de passer par le wifi ca simplifie juste la programmation mais pas le probleme.
+  ifelse not any? convois with [leader? and not dead?] [
+    set my-plan []
+  ]
+  [
+    if empty? my-plan [
+      set my-plan item ([who] of one-of convois with [leader? and not dead?]) as-path
+    ]
+  ]
+
+  if not empty? my-plan
+  [
+    let goal first my-plan
+    move-drone-towards goal
+    ; Si on est assez proche du waypoint, alors on considère qu'on a exploré la zone et on passe au prochain waypoint (pas besoin d'etre exactement sur le patch ce qui serait difficile a cause de l'angle limite lors des rotations des drones)
+    if [manhattan-distance2d myself] of goal <= 2 * simu-speed [
+      set my-plan but-first my-plan
+    ]
+  ]
+end
+
+; Exploration en cercle autour du convoi (un peu comme les aigles)
+; TODO: essayer de faire des plus grands cercles autour du convoi? Limite ce qui serait cool ce serait de le faire tout autour de tout le convoi (pas seulement du leader)! Ca ferait une super protection!
+to drone-strategy-circular-exploration
+  let newheading heading
+  
+  ; Recupere la derniere position connue du convoi (d'un des leaders du convoi)
+  let bel read-first-belief-of-type "pos-convoi"
+
+  if empty? bel [
+    move-drone-random
+    stop
+  ]
+  let pos-convoi get-belief-content bel
+  
+  if distance pos-convoi > radius-circular-strategy + circular-radius-random + 1
+  [
+    move-drone-to-convoi
+    stop 
+  ]
+  
+  if distance pos-convoi < radius-circular-strategy + circular-radius-random - 1
+  [
+    fd-drone-avoid-enemies
+    stop
+  ]
+
+  set newheading towards-nowrap pos-convoi
+  ; La tangent d'un cercle est toujour perpendiculaire au rayon
+  set newheading newheading + 90
+  let dirCorrection subtract-headings newheading heading
+
+  ifelse dirCorrection > maxturn [set dirCorrection maxturn]
+  [
+    if dirCorrection < maxturn * -1 [set dirCorrection maxturn * -1]
+  ] 
+  
+  rt dirCorrection
+  
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-drone-avoid-enemies
+end
+
+; Exploration de la carte avec une marche aleatoire
+to drone-strategy-random-exploration
+  let prevheading heading
+
+  rt (random (maxturn * 2)) - maxturn
+  
+  let dirCorrection subtract-headings heading prevheading
+  
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-drone-avoid-enemies
+end
+
+; Envoie un drone proche de soi vers le patch que le leader du convoi regarde (uniquement utilisé en play-mode)
+to drone-scout-forward [verbose]
+  ask one-of convois with [leader?] [
+    ; On trouve le patch devant nous (on veut que le drone aille au devant de la ou on regarde)
+    let where-I-look-at patch-ahead (min (list 30 ((min (list world-width world-height)) / 2) )) ; le drone va aller minimum 30 patchs en avant sauf si la carte est plus petite
+
+    ; On demande a un drone aux alentours
+    let drones-nearby wifi-get-receivers wifi-coverage-radius 
+    ifelse not any? drones-nearby [
+      if verbose [ show "Aucun drone disponible pour le moment pour partir en eclaireur!" ]
+    ]
+    [
+      ask one-of drones-nearby [
+        ; Condition de fin par timelimit
+        let cond-timelimit task[false] ; Par defaut il n'y a pas de timelimit
+        if strategy-timelimit > 0 [ ; Si un timelimit a ete fait, on va utiliser une task pour verifier si le timelimit est depasse
+          set strategy-begin-time ticks
+          set cond-timelimit task[ifelse-value (ticks >= strategy-begin-time + (strategy-timelimit * 10)) [true][false]]
+        ]
+
+        if verbose [ show "Ok je vais en eclaireur!" ]
+
+        ; Le drone va d'abord se diriger vers vers le convoi puis vers la ou regarde le convoi
+        ; C'est important que le drone atteigne d'abord la position du convoi, car sinon le drone peut choisir une autre route (plus courte) pour attendre le patch que regarde le convoi. En atteignant le convoi d'abord, on est sûr qu'ensuite le drone choisira la route devant le convoi et pas une autre.
+        let cond-end1 task[manhattan-distance2d one-of convois with [leader?] <= 3]
+        let cond-end2 task[manhattan-distance2d where-I-look-at <= 3]
+        add-intention task[drone-strategy-scout-forward where-I-look-at] task[(runresult cond-timelimit) or (runresult cond-end2)] ; execute en deuxieme
+        add-intention "move-drone-to-convoi" task[(runresult cond-timelimit) or (runresult cond-end1)] ; execute en premier
+      ]
+    ]
+  ]
+end
+
+to drone-strategy-scout-forward [target]
+  move-drone-towards target
+end
+
+; Avance tout en evitant les ennemis (corrige la trajectoire si necessaire)
+; NOTE: cette fonction permet aussi de corriger la vitesse selon l'altitude (plus lent en haute altitude)
+to fd-drone-avoid-enemies
+  drone-avoid-enemies
+end
+
+; Le drone corrige sa trajectoire pour rester hors de porte des agents potentiellement dangereux et avance
+; TODO: Erreur si les enemis sont aligne avec le drone
+;  -> corriger avec set x x + 1 en attendant mieux
+to drone-avoid-enemies
+  ; On fait le moyenne des coordonnees pour fuire dans la position opposee
+  let enemies-in-sight no-turtles
+  ifelse not play-mode-enabled? [
+    set enemies-in-sight fast-in-radius-nowrap ((turtle-set enemies (citizens with [i-am-agressive?])) with [not dead? and not will-die?]) d-sight-radius
+  ]
+  [
+    set enemies-in-sight fast-in-radius ((turtle-set enemies (citizens with [i-am-agressive?])) with [not dead? and not will-die?]) d-sight-radius
+  ]
+  if any? enemies-in-sight [
+    let x-danger [xcor] of enemies-in-sight
+    let y-danger [ycor] of enemies-in-sight
+
+    let N length x-danger
+    let x sum x-danger / N
+    set x x + 1
+    let y sum y-danger / N
+
+    ; On en deduit la meilleure direction pour fuire
+    let danger-heading acos (y / sqrt(x * x + y * y))
+    let newheading subtract-headings danger-heading 180
+    let dirCorrection subtract-headings newheading heading
+    
+    ; On fuit dans cette direction
+    ifelse dirCorrection > (maxturn * 2) [set dirCorrection (maxturn * 2)]
+    [
+      if dirCorrection < (maxturn * 2) * -1 [set dirCorrection (maxturn * 2) * -1]
+    ]
+    
+    rt dirCorrection
+    
+    set pitch drone-change-pitch
+    set roll 0
+    set roll dirCorrection * 3 / simu-speed
+  ]
+  let speed-with-alt drone-compute-speed-with-alt
+
+  ; Don't cross the boundaries of the map (there's no built-in way in NetLogo 5 to make a nowrap map)
+  ifelse not play-mode-enabled? [
+    fd-nowrap speed-with-alt
+  ]
+  ; Else in play-mode we want the drones to follow the convoi player wherever he may go
+  [
+    fd speed-with-alt
+  ]
+end 
+
+; Calcule la vraie vitesse actuelle du drone en prenant compte de l'altitude (qui fait varier la vitesse: plus rapide en basseAlt, plus lent en hauteAlt selon hauteAltSpeedMod)
+to-report drone-compute-speed-with-alt
+  report speed * (1.0 - hauteAltSpeedMod * max (list 0 (round (zcor - basseAlt))) / (hauteAlt - basseAlt) ) ; plus lent en hauteur (reduit de hauteAltSpeedMod de 0.0 a 1.0), mais en basse altitude ou en-dessous il n'y a aucun changement de vitesse
+end
+
+; Intention generees au debut de la simulation pour les drones
+; Definissez ici les beliefs et intentions a faire au debut pour lancer les drones
+to drones-start
+  set heading 270
+  add-intention "drones-take-off" "true"
+end
+
+; S'assure que le drone a assez de fuel, sinon si on est loin de la base et qu'on a juste assez de fuel pour y aller on y va se recharger
+to drones-check-needs
+  if empty? get-intention or (intention-name get-intention != "drones-landing" and intention-name get-intention != "drones-take-off") [
+    let dist-to-base (manhattan-distance2 patch-here base-entry) + (manhattan-distance2 base-entry base-central)
+    if (dist-to-base / drone-compute-speed-with-alt) * fuel-dec >= (fuel - fuel-safe-margin) [
+      add-intention "drones-landing" "true"
+    ]
+  ]
+end
+
+; Mort d'un drone: active la variable dead?, le colorie en rouge et le fait tomber au sol (il ne bougera plus)
+to drone-kill
+  set dead? true
+  set color red
+  set zcor solAlt
+  ask link-neighbors [ hide-turtle ]
+end
+
+; Deplace les drones vers le convoi sans utiliser les croyances/communications (les drones se dirigeront toujours vers le convoi ou qu'il soit)
+to move-drone-to-convoi-nowifi
+  let newheading heading
+  
+  ifelse not play-mode-enabled?
+  [ set newheading towards-nowrap one-of convois with [leader?] ]
+  [ set newheading towards one-of convois with [leader?] ]
+
+  let dirCorrection subtract-headings newheading heading
+
+  ;;rt min (list ((newheading - oldheading) mod 360) 50)
+  ifelse dirCorrection > maxturn [set dirCorrection maxturn]
+  [
+    if dirCorrection < maxturn * -1 [set dirCorrection maxturn * -1]
+  ]
+  
+  rt dirCorrection
+  
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-nowrap speed
+end
+
+; Deplace les drones vers le convoi
+; Avec wifi, on se deplace vers la derniere position connue du convoi, pas la position absolue
+to move-drone-to-convoi
+  let newheading heading
+  
+  ; Recupere la derniere position connue du convoi (d'un des leaders du convoi)
+  let bel read-first-belief-of-type "pos-convoi"
+
+  ; Aucune info concernant la position du convoi? Alors on se déplace aléatoirement
+  if empty? bel [
+    move-drone-random
+    stop
+  ]
+  let pos-convoi get-belief-content bel
+
+  ; Si on n'a pas encore atteint l'endroit du convoi, on y va
+  ifelse not ([manhattan-distance2d pos-convoi] of patch-here <= 2) [
+    ifelse not play-mode-enabled?
+    [ set newheading towards-nowrap pos-convoi ]
+    [ set newheading towards pos-convoi ]
+  ]
+  ; Si on a atteint l'endroit du convoi
+  [
+    ; Gestion de coherence: S'il n'y a aucun convoi ici, on supprime la croyance car elle est mauvaise (le convoi s'est soi deplace soit est mort)
+    if not any? convois with [leader? and not dead? and not finished? and manhattan-distance2d myself <= 2] [
+      remove-belief bel
+    ]
+    
+    ; Ensuite on doit quand meme se deplacer. Mais ou?
+    
+    ; Go to nearest drone position
+    ;let pos-nearest-drone (patch-set (map [get-belief-content ?] (beliefs-of-type "pos"))) with-min [distance myself]
+    ;set newheading towards-nowrap pos-nearest-drone
+    
+    ; Move randomly until we find someone who can send us a new position
+    move-drone-random ; since we remove-belief, this here will be called once, then drones-think will not trigger move-drone-to-convoi since there won't be any convoi, at least not this one but it may now focus on another convoi leader if there are multiple
+    stop
+  ]
+
+  let dirCorrection subtract-headings newheading heading
+
+  ;;rt min (list ((newheading - oldheading) mod 360) 50)
+  ifelse dirCorrection > maxturn [set dirCorrection maxturn]
+  [
+    if dirCorrection < maxturn * -1 [set dirCorrection maxturn * -1]
+  ]
+
+  rt dirCorrection
+
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-drone-avoid-enemies
+end
+
+; Deplace les drones vers un but (en general un patch)
+to move-drone-towards [goal]
+  let newheading heading
+  ifelse not play-mode-enabled?
+  [ set newheading towards-nowrap goal ]
+  [ set newheading towards goal ]
+
+  let dirCorrection subtract-headings newheading heading
+
+  ;;rt min (list ((newheading - oldheading) mod 360) 50)
+  ifelse dirCorrection > maxturn [set dirCorrection maxturn]
+  [
+    if dirCorrection < maxturn * -1 [set dirCorrection maxturn * -1]
+  ]
+  
+  rt dirCorrection
+  
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-drone-avoid-enemies
+end
+
+; Deplace les drones aleatoirement
+to move-drone-random
+  let prevheading heading
+
+  rt (random (maxturn * 1.5)) - (random (maxturn)) ; bizarrement avec le random les drones ont tendance a aller plus souvent a gauche, mais on prefererait que ce soit vers la droite car il y a les murs du monde a gauche...
+  
+  let dirCorrection subtract-headings heading prevheading
+  
+  set pitch drone-change-pitch
+  set roll 0
+  set roll dirCorrection * 3 / simu-speed
+  fd-drone-avoid-enemies
+end
+
+; Si une demande de changement d'altitude a ete faite, on va changer le pitch progressivement (et donc l'altitude)
+to-report drone-change-pitch
+  ; Pas de changement d'altitude en cours
+  ifelse altGoal = false [
+    report 0
+  ]
+  ; Changement d'altitude
+  [
+    ifelse abs (altGoal - zcor) < 0.5
+    [
+      set altGoal false ; condition d'arret: on a atteint l'altitude qu'on voulait
+      report 0
+    ]
+    [
+      let maxpitchcorrec 1
+      let maxpitch 45
+      let newpitch towards-pitch-xyz ([pxcor] of patch-ahead 1) ([pycor] of patch-ahead 1) altGoal ; beaucoup plus fiable que altGoal - pzcor, bizarrement ca fait des trucs bizarres des fois avec le drone qui va dans le pitch oppose a ce qu'il faudrait
+      let pitchCorrection subtract-headings altGoal pzcor
+      set pitchCorrection limit-range maxpitchcorrec pitchCorrection
+      report (pitchCorrection + pitch)
+    ]
+  ]
+end
+
+; Animation de decollage des drones. Necessite juste une piste (patch with [base?]) en forme de L (car il tourne toujours a droite)
+; Refait le plein de fuel et de munitions en meme temps
+to drones-take-off
+
+  let lspeed speed
+
+  ; Precaching some data to accelerate
+  let base-max-pycor 0
+  let base-min-pycor 0
+  ifelse anim-tmp = nobody [
+    set base-max-pycor max [pycor] of base-patches
+    set base-min-pycor [pycor] of base-central
+    set anim-tmp (list base-max-pycor base-min-pycor)
+  ]
+  [
+    set base-max-pycor item 0 anim-tmp
+    set base-min-pycor item 1 anim-tmp
+  ]
+
+  ; Init du decollage
+  if take-off-anim-frame = 0 [ set take-off-anim-frame 1 ]
+
+  ; Frame 1: avance le long de la piste
+  if take-off-anim-frame = 1 [
+    ; Critere d'arret de la frame 1 et preparation de la frame 2
+    let right-patch [patch-at 0 0 (pzcor * -1)] of (patch-right-and-ahead 90 1)
+    if [base?] of right-patch and xcor <= ([pxcor] of right-patch) [ ; on ne tourne que si le patch a droite est une piste ET qu'on a suffisamment avance vers le centre du patch (evite au drone de longer le bord du patch)
+      set take-off-anim-frame 2
+      set prev-heading heading ; On memorise l'angle actuel comme ca on saura quand on aura fini de tourner exactement 90 degres
+    ]
+
+    ; On avance seulement s'il n'y a pas de drone devant (s'il y en a un qui n'a pas fini de tourner)
+    if not any? drones-on patch-ahead 2 and not any? drones-on patch-ahead 1 [
+      fd (lspeed / 2)
+    ]
+  ]
+
+  ; Frame 2: tourne au coude de la piste
+  if take-off-anim-frame = 2 [
+    rt 2 * simu-speed
+
+    ; Critere d'arret frame 2 et preparation de la frame 3
+    if subtract-headings heading prev-heading >= 90 [
+      set take-off-anim-frame 3
+    ]
+  ]
+
+  ; Frame 3: decollage
+  if take-off-anim-frame = 3 [
+    let dist (base-max-pycor + 1) - base-min-pycor
+    ;let alt (((base-max-pycor + 1) - pycor) / dist * (basseAlt - solAlt) + solAlt) ; triangular shape! En piqué!
+    let alt ( (1 - (((base-max-pycor + 1) - ycor) / dist)) * (basseAlt - solAlt) + solAlt + 1) ; calcul d'un angle pour le pitch, pour que l'avion monte moins le nez au debut et plus vers la fin
+    face-nowrap patch pxcor (base-max-pycor + 1) alt
+    fd lspeed
+
+    ; Fin de l'animation
+    if pycor >= (base-max-pycor + 1) [
+      set take-off-anim-frame 0 ; fin de l'animation
+      set zcor basseAlt
+    ]
+  ]
+
+  ; Animation en cours, on repush l'intention
+  ifelse take-off-anim-frame != 0 [
+    add-intention "drones-take-off" "true"
+  ]
+  ; Sinon l'animation est terminee
+  [
+    set anim-tmp nobody ; resetting anim-tmp for use in other procedures
+  ]
+
+  ; Et on refait le plein
+  set fuel max-fuel - random (max-fuel / 5) + random (max-fuel / 10)  ; pour eviter que tous les drones ne rentrent au meme moment
+  set ammo max-ammo
+end
+
+; Force l'atterrissage des drones
+to drones-landing-debug
+  let free-drones drones with [empty? get-intention and not dead?]
+  if any? free-drones [
+    ask one-of free-drones [
+      add-intention "drones-landing" "true"
+    ]
+  ]
+end
+
+; Animation d'atterrissage des drones. Ne necessite qu'une longue piste horizontale (car il essaiera toujours d'atterrir par la droite)
+to drones-landing
+  let lspeed speed
+
+  ; Precaching some data to accelerate
+  let base-max-pxcor nobody
+  let base-min-pxcor nobody
+  ifelse anim-tmp = nobody [
+    set base-max-pxcor base-entry
+    set base-min-pxcor base-central
+    set anim-tmp (list base-max-pxcor base-min-pxcor)
+  ]
+  [
+    set base-max-pxcor item 0 anim-tmp
+    set base-min-pxcor item 1 anim-tmp
+  ]
+
+  ; Init de l'atterrissage
+  if landing-anim-frame = 0 [ set landing-anim-frame 1 ]
+
+  ; Frame 1: on se dirige vers l'entree de la piste d'atterrissage (le patch le plus a droite, avec max pxcor)
+  if landing-anim-frame = 1 [
+    move-drone-towards base-max-pxcor
+
+    ; Critere d'arret frame 1 et preparation de la frame 2
+    ;if xcor <= ([pxcor] of base-max-pxcor) and ycor <= ([pycor] of base-max-pxcor) [
+    if [manhattan-distance2d myself] of base-max-pxcor < 1 [ ; on ne tourne que si le patch a droite est une piste ET qu'on a suffisamment avance vers le centre du patch (evite au drone de longer le bord du patch)
+      set landing-anim-frame 2
+      set heading 270 ; on triche, on force la bonne orientation vers la piste d'atterrissage des drones, sinon ca peut etre TRES complique s'ils doivent faire attention eux-meme, il faudrait alors utiliser un algorithme du genre AStar mais contraint et en plus en lissant le chemin. Trop compliquee pour cette implementation, il vaut mieux faire autrechose.
+    ]
+  ]
+
+  ; Frame 2: atterrissage le long de la piste, vers le patch avec min pxcor
+  if landing-anim-frame = 2 [
+    ; Calcul de la direction vers le patch but (le patch base-central avec min pxcor et min pycor, la ou on va atterrir)
+    let goal patch ([pxcor] of base-min-pxcor) ([pycor] of base-max-pxcor) solAlt
+    face-nowrap goal
+    set roll 0
+
+    ; calcul d'un angle pour le pitch, pour que l'avion descende plus le nez au debut et moins vers la fin (dessine une courbe)
+    let dist abs (([pxcor] of base-max-pxcor + 1) - [pxcor] of base-min-pxcor)
+    let pitch-alt ((abs (xcor - ([pxcor] of base-min-pxcor))) / dist) * ((abs (zcor - ([pzcor] of base-min-pxcor))) / (basseAlt - solAlt)) * 60 ; on contraint la courbe par rapport a la distance vers le patch-but, mais aussi par rapport a la distance au sol pour eviter que le drone ne rentre dans le sol
+    set pitch pitch-alt * -1 ; on fait un angle negatif car 0 = tout droit, < 0 pour descendre et > 0 pour monter
+
+    ; Avance
+    fd lspeed
+
+    ; Fin de l'animation, on va enchainer sur le decollage
+    ; TODO: ameliorer la detection du patch en utilisant de la logique floue! (En disant que c'est OK des lors qu'on est aux environs du patch goal)
+    if ((floor xcor) <= [pxcor + 1] of goal and (floor ycor) <= [pycor + 1] of goal) or patch-ahead 1 = goal [
+      set landing-anim-frame 0 ; fin de l'animation
+      set zcor solAlt ; triche: on s'assure que le drone est bien a la bonne hauteur
+      set pitch 0
+      set roll 0
+    ]
+  ]
+
+  ; Animation en cours, on repush l'intention
+  ifelse landing-anim-frame != 0 [
+    add-intention "drones-landing" "true"
+  ]
+  ; Sinon l'animation est terminee
+  [
+    set anim-tmp nobody ; resetting anim-tmp for use in other procedures
+    add-intention "drones-take-off" "true" ; on enchaine sur le decollage
+  ]
+end
+
+to drone-ascend
+  if pzcor != hauteAlt [
+    set altGoal hauteAlt
+  ]
+end
+
+to drone-descend
+  if pzcor > basseAlt [
+    set altGoal basseAlt
+  ]
+end
+
+; Detection et attaque des drones
+; La procedure fonctionne en deux parties distinctes
+; 1- Detection agressivite nouvel individu: Verifie si un individu en vue est deja detecte, sinon detecte s'il est agressif par banque d'image ou a defaut par comportement
+; 2- Attaque des individus deja detectes: Si un individu deja detecte est dans la liste de ceux a tuer (le QG a deja donne le feu vert), alors on va l'attaquer
+to drone-detect-enemies
+  ; Des individus (vivants) en vue?
+  let enemies-in-radius fast-in-radius-nowrap ((turtle-set enemies citizens) with [not dead? and not will-die?]) d-sight-radius
+  if(any? enemies-in-radius)[
+    let idEnemys [who] of enemies-in-radius
+
+    ; Pour chaque individu, on va checker si on les a deja vu, sinon on va checker s'ils sont agressifs, et si oui on va alerter le QG
+    foreach idEnemys  [
+      let enemyID ?
+      
+      ;--------------------------------
+      ; Detection d'un nouvel individu
+      ;--------------------------------
+
+      ; Verifie si on n'a pas deja eu un rapport de detection concernant cet individu (soit par soi-meme soit une detection par un autre)
+      let bel get-beliefs-with-key "enemy-detection" (word enemyID)
+
+      ; Si personne n'avait encore detecte cet individu (a notre connaissance tout du moins)
+      ; alors on le detecte
+      if(empty? bel) [
+        show (word "Nouvel individu en vue: " enemyID)
+        let agressive? false ; pacifique par defaut
+
+        ; Detection par banque d'images (reconnait les types Ennemies)
+        ifelse( drone-detection-shape-based enemyID  )[ 
+          ; Positif, c'est un ennemi agressif
+          show (word "Ennemi detecte par image: " enemyID)
+          set agressive? true
+        ]
+        ; Sinon la banque d'images ne l'a pas reconnu, mais on va essayer de detecter par le comportement
+        [
+          ; Detection par comportement (pour les types Citizens)
+          if (drone-detection-behavior-based enemyID) [
+            ; Positif, citizen agressif reconnu
+            show (word "Ennemi detecte par comportement: " enemyID)
+            set agressive? true
+          ]
+        ]
+
+        ; Broadcast la detection a tous les autres drones
+        let b-type "enemy-detection"
+        let key enemyID  ;[who] of enemies-in-radius         
+        let content (list ([patch-here] of turtle enemyID) agressive?)
+
+        wifi-broadcast wifi-coverage-radius b-type key content ; envoi aux autres agents
+        wimax-send (turtle-set self) b-type key content ; envoi a soi-meme pour stocker la croyance
+
+        ; Debut de la phase d'attaque
+        ; Si l'individu est agressif, alors on va alerter le QG et demander l'autorisation de tir
+        if agressive? [
+          drone-contact-hq "hq-ask-attack-enemy" enemyID task[hq-ask-attack-enemy enemyID]
+        ]
+      ]
+
+      ;--------------------------------
+      ; Attaque d'un individu agressif
+      ;--------------------------------
+
+      ; Est-ce qu'on a eu une autorisation de tir sur cet individu?
+      set bel get-beliefs-with-key-content "hq-ask-attack-enemy" (word enemyID) true
+
+      ; Si oui, alors on va l'attaquer (s'il est encore vivant)
+      let target turtle enemyID
+      if(not empty? bel and [not dead? and not will-die?] of target)[
+
+        ; Attaque a 1 drone: on peut attaquer tout de suite
+        ifelse d-group-attack <= 1 [
+          ; Si on a assez de munitions on va l'attaquer de suite
+          ifelse ammo > 0 [
+            add-intention task[drone-strategy-go-kill-enemy enemyID] task[true]
+          ]
+          ; Sinon en va se recharger a la base et on revient le tuer
+          [
+            add-intention task[drone-strategy-go-kill-enemy enemyID] task[true]
+            add-intention "drones-landing" "true" ; La derniere intention est executee en premier car c'est du FILO
+          ]
+        ]
+        ; Sinon il faut se regrouper pour tirer a plusieurs
+        [
+          ifelse d-group-attack > count drones with [not dead?] [
+            show (word "There's not enough drones to carry attack on target " (turtle enemyID) " !")
+          ]
+          [
+            if watch-grouping [
+              show (word "Calling for reinforcement to attack enemy " enemyID)
+              watch-me
+            ]
+            add-intention task[drone-strategy-callout enemyID] task[true]
+            if ammo <= 0 [
+              add-intention "drones-landing" "true" ; La derniere intention est executee en premier car c'est du FILO
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+to drone-strategy-callout [enemyID]
+  ifelse any? convois with [not dead?]
+  [ move-drone-to-convoi ]
+  [ move-drone-random ]
+  wifi-broadcast wifi-coverage-radius "reinforcement-request" enemyID who
+  let bels get-beliefs-with-key "reinforcement-ok" enemyID
+  ifelse length bels >= d-group-attack
+  [ add-intention task[drone-strategy-callout enemyID] task[true] ]
+  [
+    if watch-grouping [ show "Regrouping, waiting for other drones" ]
+    add-intention task[drone-strategy-regroup enemyID (ticks + strategy-timelimit)] task[true]
+  ]
+end
+
+to drone-strategy-regroup [enemyID timelimit]
+  ; Tourne en cercle sur lui meme en attendant les autres
+  let angle 2 * simu-speed
+  set heading heading + angle
+  set roll angle * 3
+  set pitch 0
+  fd-drone-avoid-enemies
+
+  ; Attend les autres
+  let bels filter [item 0 read-from-string get-belief-key ? = enemyID] (beliefs-of-type "reinforcement-ok")
+  let drones-to-wait list-to-agent-set map [drone (item 1 (read-from-string get-belief-key ?))] bels
+  ifelse not any? drones-to-wait or any? (drones-to-wait with [manhattan-distance2d myself > (min (list d-sight-radius (3 * simu-speed)))]) ; or d-sight-radius but most of the time you won't see the grouping process since the drone will instantly see its friends
+  [
+    if timelimit <= 0 or ticks <= timelimit [ ; evite d'essayer de se regrouper indefiniment si les autres drones sont parti faire autre chose ou si la cible a deja ete tuee
+      add-intention task[drone-strategy-regroup enemyID timelimit] task[true]
+    ]
+  ]
+  [
+    if watch-grouping [ show (word "Party grouped, let's go kill " (turtle enemyID)) ]
+    add-intention task[drone-strategy-go-kill-enemy enemyID] task[true]
+  ]
+end
+
+to drone-strategy-go-kill-enemy [enemyID]
+  let target turtle enemyID
+  ; Enemi dans le champ de vision? On tire
+  ifelse member? target fast-in-radius-nowrap (turtle-set enemies citizens) d-sight-radius
+  [
+    if watch-grouping [ reset-perspective show (word "Target " (turtle enemyID) " was gunned down.") ]
+    drone-shoot-enemy target
+    wifi-broadcast wifi-coverage-radius "reinforcement-request" enemyID false
+    wimax-send (turtle-set self) "reinforcement-request" enemyID false
+  ]
+  ; Sinon il faut se rapprocher pour pouvoir tirer
+  [
+    move-drone-towards target
+    add-intention task[drone-strategy-go-kill-enemy enemyID] task[true]
+  ]
+end
+
+to-report hq-ask-attack-enemy [enemyID]
+  ask turtle enemyID [
+    watch-me
+    display
+  ]
+  let ret user-yes-or-no? (word "Autorisation de tir sur individu agressif " enemyID)
+  reset-perspective
+  report ret
+end
+
+to  drone-shoot-enemy [target]
+  if not [dead?] of target and not [will-die?] of target [
+    set ammo ammo - 1
+    shoot-missile-towards target task[ask my-target [enemy-kill] ]
+    ask target [ set will-die? true ]
+  ]
+end
+
+
+
+;-------
+;  QG 
+;-------
+; Le QG est un simulacre de l'utilisateur de la simulation, il permet aux drones de contacter par des messages une entite HQ qui va s'occuper de poser la question souhaitee a l'utilisateur (une sorte de relais virtuel entre la simulation et l'utilisateur de la simulation).
+
+to hq-think
+  ask HQs [
+    hq-receive-messages-and-reply
+  ]
+end
+
+; Question d'exemple pour demander au QG
+; La reponse sera envoyee automatiquement au drone qui en a fait la demande, et qui la partagera ensuite automatiquement avec tous les autres drones qu'il croisera
+to-report hq-ask-dummy
+  report user-yes-or-no? "C'est une question d'exemple. Vous etes d'accord?"
+end
+
+; Juste une question d'exemple utilisable depuis le GUI
+; La fonction callback task[hq-ask-dummy] est la fonction qui sera appelee par le QG pour poser la question a l'utilisateur (voir la procedure hq-ask-dummy)
+; La reponse sera stockee dans la meme croyance que le performative de la question, c'est a dire dans "hq-ask-dummy".
+; Par exemple, apres avoir appele cette procedure, il suffit de faire ask drones [ show beliefs-of-type "hq-ask-dummy" ] pour voir la reponse (true ou false)
+to drone-contact-hq-debug
+  if any? drones with [not dead? and not will-die?] [
+    ask one-of drones with [not dead? and not will-die?] [
+
+      drone-contact-hq "hq-ask-dummy" "key" task[hq-ask-dummy]
+
+    ]
+  ]
+end
+
+
+
+;=======================
+;     COMMUNICATIONS
+;=======================
+
+; DEV NOTES (deprecated, maintenant on l'a implemente, voir les commentaires des procedures de communication)
+; Communication primitives:
+; 1- proc qui définit quels prédicats on envoit, pour limiter ce qui est utile (pos, enemy contenant le type metainfos comme image et pos, etc.)
+; 2- two new message fields: timestamp + original from
+; 3- belief last-time-seen: définit quand on a vu un drone ami ou un convoi la derniere fois (quand on s'est connecté avec pour la derniere fois)
+; 4- 3 modes d'envoi de messages:
+;  * wifi-broadcast: broadcast quand on vient juste de recevoir un msg ou from = original from. Ou mieux: on broadcast à ceux avec qui on est en communication mais qui ne sont pas dans le TO du msg original (on check si from = original from pour eviter de resender en boucle).
+;  * wifi-relay: on relaye tout de suite un message aux voisins qui ne l'ont pas recu (trop loin de l'original-sender)
+;  * wifi-update: envoi a un drone spécifique quand on le revoit de tous les derniers messages ou msg-timestamp > last-time-seen
+
+;--------
+; Convoi
+;--------
+
+; Partage de ses infos aux agents drones a chaque tick (en vrai tous les send-interval ticks)
+; EDITEZ ICI si vous souhaitez que le convoi envoie plus d'infos que sa position
+to convoi-send-messages
+  ; On n'envoie des messages que tous les send-interval, pour eviter de flooder les communications (ca permet aussi d'etre plus furtif)
+  if ticks >= last-send-time + send-interval [
+    ; do stuff, like sending positions to others
+    wifi-broadcast wifi-coverage-radius "pos-convoi" who patch-here
+
+    ; MAJ du timestamp de la derniere fois qu'on a envoye nos infos, pour savoir quand on va faire le prochain update
+    set last-send-time ticks
+  ]
+end
+
+; Reception et traitement des messages par le convoi
+; Note: rien du tout ici, le convoi ne fait qu'envoyer sa position mais ne receptionne pas les messages des drones. C'est une communication unilateral (le convoi ordonne, les drones suivent).
+to convoi-receive-messages
+  set incoming-queue [] ; on vide juste la liste des messages
+end
+
+
+;--------
+; Drones
+;--------
+
+; EDITEZ ICI!
+; Partage de ses infos aux autres agents a chaque tick (en vrai tous les send-interval ticks)
+; IMPORTANT: Modifiez ici si vous voulez rajouter des croyances a partager entre les agents drones, ne modifiez rien d'autre sauf si vraiment necessaire et que vous savez ce que vous faites!
+to drone-send-messages
+  ; On n'envoie des messages que tous les send-interval, pour eviter de flooder les communications (ca permet aussi d'etre plus furtif)
+  if ticks >= last-send-time + send-interval [
+    
+    ; Envoi de la position actuelle du drone a ses copains drones
+    wifi-broadcast wifi-coverage-radius "pos" who patch-here
+
+    ; Maintien automatique du lien de communication avec le QG (beacon)
+    ; Keep-alive automatique du lien avec le QG (on verifie qu'on est connecte)
+    ; TODO: ameliore pour envoyer des beacons seulement si necessaire (quand un des drones en reseau a besoin de demander un truc au QG, le lien devrait etre passif)
+    if (pzcor >= hauteAlt) [
+      let recv turtle-set (one-of HQs)
+      wimax-send recv "hq-beacon" ([who] of recv) true
+    ]
+
+    ; MAJ du timestamp de la derniere fois qu'on a envoye nos infos, pour savoir quand on va faire le prochain update
+    set last-send-time ticks
+  ]
+end
+
+; Traitement des messages speciaux qui necessitent peut etre une reponse
+; Par exemple en cas de demande de renfort pour aller tuer un ennemi, on doit repondre tout de suite si on est dispo ou pas
+to drone-process-special-messages [msg]
+  ; PAS BON: parce que si l'agent recoit plusieurs requetes successives, il va essayer de toutes les faire! Il vaut mieux travailler sur les beliefs, un a la fois
+;  if get-performative msg = "reinforcement-request" and empty? intentions [
+;    let author get-original-sender msg
+;    let key get-key msg
+;    wimax-send author "reinforcement-ok" key who
+;  ]
+end
+
+; Reception et traitement des messages envoyes par d'autres drones ou par les leaders du convoi
+; Note: c'est ici qu'on convertit les messages en croyances
+to drone-receive-messages
+  while [not empty? incoming-queue]
+  [
+    ; On convertit le message en belief pour pouvoir le comparer a la base de connaissances
+    let msg get-message
+    let performative get-performative msg
+    let key (get-key msg)
+    let orig-sender (get-original-sender msg)
+    let timestamp (get-timestamp msg)
+    let sender (get-sender-msg msg)
+
+    let bel (list performative key (get-content msg) orig-sender timestamp )
+    let uniq-bel (list performative key)
+
+    ; Verifie qu'on n'a pas deja ajoute cette croyance, ou si une autre existe on la supprime
+    let chk position uniq-bel (map [(list (item 0 ?) (item 1 ?))] beliefs) ; on ne compare que le nom de croyance + key (unique identifier) car le content change biensur, tout comme le timestamp
+
+    ; Si on n'a pas du tout cette info, on l'ajoute directement
+    ifelse chk = false [
+      add-belief bel ; ajout de l'info
+      wifi-update sender
+      update-last-seen-time sender timestamp ; MAJ du timestamp de la derniere fois qu'on a vu cet agent
+      wifi-relay wifi-coverage-radius msg ; On ne relaye un message que si on le trouve interessant, sinon on fait blocus ce qui va eviter qu'un message ne soit relaye indefiniment
+      if debug-more [ show (word uniq-bel " " timestamp " ADD") ]
+    ]
+    ; Sinon on a deja une meme info, mais peut etre de date differente
+    [
+      ; Si l'info qu'on vient de recevoir dans le message est plus nouvelle, on remplace l'ancienne par la nouvelle
+      ifelse timestamp > (get-belief-timestamp (get-belief-id chk)) [
+        set beliefs remove-item chk beliefs ; on supprime l'ancienne info (on ne remplace pas car on veut replacer le belief en haut du stack, pour que les beliefs soient FIFO, ordonnes par le timestamp)
+        add-belief bel ; On ajoute la nouvelle info en haut du stack
+        wifi-update sender
+        update-last-seen-time sender timestamp ; MAJ du timestamp de la derniere fois qu'on a vu cet agent
+        wifi-relay wifi-coverage-radius msg ; On ne relaye un message que si on le trouve interessant, sinon on fait blocus ce qui va eviter qu'un message ne soit relaye indefiniment
+        if debug-more [ show (word uniq-bel " " timestamp " REPLACE") ]
+      ]
+      ; Sinon on la zappe car on a deja une info au moins aussi recente si ce n'est plus
+      [
+      if debug-more [ show (word uniq-bel " " timestamp " SKIP " chk) ]
+      ]
+    ]
+
+    ; Traitement des messages speciaux qui necessitent peut etre une reponse
+    drone-process-special-messages msg
+  ]
+end
+
+; MAJ du timestamp de la derniere fois qu'on a entendu parler de l'agent qui a communiqué avec nous (permettra de lui envoyer des news avec wifi-update plus tard si on ne l'a pas vu entre temps)
+to update-last-seen-time [orig-sender timestamp]
+  set last-seen-time (ntable:put last-seen-time orig-sender timestamp)
+end
+
+; Contacte le QG pour demander une fonction contenue dans callback, et la reponse sera renvoyee avec la croyance b-type
+to drone-contact-hq [b-type key callback]
+  ; On est deja connecte, on envoie la question qu'on voulait
+  ifelse (not empty? beliefs-of-type "hq-beacon" and ticks <= (get-belief-timestamp read-first-belief-of-type "hq-beacon") + send-interval * 2) [
+    let recv turtle-set (one-of HQs)
+    wimax-send recv b-type key callback ; TRICHE: normalement on devrait faire deux cas: le cas ou on est connecte directement (hauteur suffisante) ou soit par l'intermediaire d'un drone-relais (auquel cas on doit propager la question comme un message normal, et le drone-relais devrait transmettre le message). TODO: faire ca en modifiant ici + drone-receive-messages (mais comment faire la difference entre la question et la reponse? pour pas renvoyer la reponse au QG au lieu des autres drones)
+  ]
+  ; On est pas connecte au QG, on va se connecter soi-meme et faire relais pour les autres
+  [
+    ; Si on n'est pas a la bonne hauteur, on monte en altitude
+    ifelse not (pzcor >= hauteAlt) [
+      drone-ascend
+    ]
+    ; Sinon on est a la bonne hauteur mais plus connect au QG, on lui envoie une demande de connection (beacon)
+    [
+      ; On envoie un beacon pour demander la connection avec le QG
+      let recv turtle-set (one-of HQs)
+      wimax-send recv "hq-beacon" ([who] of recv) true
+    ]
+    ; On relancera l'intention jusqu'a ce qu'on soit connecte au QG
+    add-intention task[drone-contact-hq b-type key callback] "true"
+
+    move-drone-random
+  ]
+end
+
+
+;---------
+;   QG
+;---------
+
+; Reception, traitement et reponse du QG
+; Deux fonctionnements:
+;   * soit le drone nous envoie un "beacon" pour etablir ou maintenir une connection avec le QG, dans ce cas on lui repond automatiquement.
+;   * soit le drone nous demande de repondre a une question. Dans ce cas on affiche la question a l'utilisateur et on renvoie au drone la reponse.
+; ATTENTION: la croyance (b-type) doit commencer par "hq-"
+; Ne pas modifier cette fonction sauf si vous savez vraiment ce que vous faites.
+to hq-receive-messages-and-reply
+  while [not empty? incoming-queue]
+  [
+    ; Recupere le message
+    let msg get-message
+    ; Decomposition du message pour recuperer chaque champ
+    let b-type get-performative msg
+    let key (get-key msg)
+    ;let orig-sender (get-original-sender msg) ; orig-send est le drone qui pose la question
+    ;let timestamp (get-timestamp msg)
+    let sender (get-sender-msg msg) ; sender est le drone qui a relaye le message au QG (celui qui est en connection directe avec le QG). Biensur ca peut etre le meme que orig-sender mais c'est pas toujours le cas.
+    let content get-content msg
+
+    ; Traitement du message SEULEMENT si ca commence par "hq-". C'est pour corriger un bug bizarre qui fait qu'a un moment en play-mode (et peut etre dans la simu normale) les drones commencent a envoyer leur position et leurs croyances au QG, ce qui ne devrait PAS arriver! Et lui les repete avec comme contenu "true", ce qui casse tout le fonctionnement
+    ; TODO: trouver un vrai correctif? Pourquoi les drones se mettent a communiquer leurs croyances au QG quand ils sont connectes? Normalement ils ne devraient communiquer qu'avec les drones uniquement!
+    if substring b-type 0 3 = "hq-" [
+      ; Si c'est un beacon (demande de connection ou maintien de la connection avec le QG), on repond pour confirmer que le lien est fait
+      ifelse b-type = "hq-beacon" [
+        wimax-send (turtle-set (turtle sender)) b-type key true
+      stop ; on arrete avec ce message (le while continuera), c'est comme le break en C++
+      ]
+      ; Sinon c'est une question, on appelle la fonction de rappel (callback) contenue dans content et on renvoie la reponse de l'utilisateur
+      [
+        let choice false
+        ifelse hq-always-yes or play-mode-enabled? ; Si on joue, on ne veut pas controler le QG, il repondra toujours oui
+        [ set choice true ]
+        [ ifelse is-reporter-task? content [ set choice runresult content ] [ set choice true ] ]
+        wimax-send (turtle-set (turtle sender)) b-type key choice ; On renvoie la reponse au drone-relais, qui va de toutes facons le transmettre au drone orig-send (celui qui a pose la question) automatiquement car c'est un message comme un autre qui sera relaye comme tous les autres et stocke comme une croyance chez tous les drones
+        stop
+      ]
+    ]
+  ]
+end
+
+
+;---------
+; Generic
+;---------
+; Ce qui suit sont des procedures generiques pour l'implementation technique du systeme de communication.
+; C'est ce qui gere au bas niveau comment les messages et croyances sont partagees entre les drones.
+; Tout ceci est automatique et generique.
+; Ne pas modifier ces fonctions sauf si vous savez vraiment ce que vous faites.
+
+; Pleins de fonctions pour recuperer les champs custom des messages (dont key, original-sender et timestamp)
+to-report get-belief-id [id]
+  ifelse is-list? id [
+    let bel-list []
+    foreach id [
+      set bel-list lput (item id beliefs) bel-list
+    ]
+    report bel-list
+  ]
+  [report item id beliefs]
+end
+
+to-report get-key [msg]
+  report item 0 (get-field "key" msg)
+end
+
+to-report get-original-sender [msg]
+  let ret item 0 (get-field "original-sender" msg) ; item 0 car get-field retourne une liste (s'il y a plusieurs elements de ce champ comme pour receiver), donc on prend le premier element ici puisqu'on sait qu'il n'y en a qu'un seul
+  if not is-number? ret [ set ret read-from-string ret ]
+  report ret
+end
+
+to-report get-timestamp [msg]
+  let ret item 0 (get-field "timestamp" msg)
+  if not is-number? ret [ set ret read-from-string ret ] ; read-from-string to convert string to number
+  report ret
+end
+
+to-report get-sender-msg [msg]
+  let ret get-sender msg
+  if not is-number? ret [ set ret read-from-string ret ] ; read-from-string to convert string to number
+  report ret
+end
+
+to-report get-belief-key [belief]
+  report item 1 belief
+end
+
+to-report get-belief-content [belief]
+  report item 2 belief
+end
+
+to-report get-belief-original-sender [belief]
+  let ret item 3 belief
+  if not is-number? ret [ set ret read-from-string ret ]
+  report ret
+end
+
+to-report get-belief-timestamp [belief]
+  let ret last belief
+  if not is-number? ret [ set ret read-from-string ret ]
+  report ret
+end
+
+to-report get-beliefs-with-key [b-type key]
+  let bels beliefs-of-type b-type
+  let bel []
+  if not empty? bels [
+    set bel (filter [get-belief-key ? = key] bels)
+  ]
+  report bel
+end
+
+to-report get-beliefs-with-key-content [b-type key content]
+  let bels beliefs-of-type b-type
+  let bel []
+  if not empty? bels [
+    set bel (filter [get-belief-key ? = key] bels)
+    set bel (filter [get-belief-content ? = content] bel)
+  ]
+  report bel
+end
+
+; Recupere la liste des drones aux alentours qui sont assez proche pour communiquer (dans la couverture wifi)
+to-report wifi-get-receivers [coverage]
+  let recv turtle-set nobody
+  ifelse coverage > 0 [
+    let drones-nearby no-turtles
+    ifelse not play-mode-enabled?
+    [ set drones-nearby fast-in-radius-nowrap (other drones) wifi-coverage-radius ]
+    [ set drones-nearby fast-in-radius (other drones) wifi-coverage-radius ] ; in play-mode, drones and convoi must be able to communicate across map boundaries
+    if any? drones-nearby[ set recv drones-nearby ]
+  ]
+  [
+    set recv (other drones)
+  ]
+  report recv
+end
+
+; Envoi d'un message qu'on genere, vers tous les agents a proximite
+to wifi-broadcast [coverage b-type key content] ; b-type = performative
+  ; Liste des receveurs selon la zone de coverage
+  let recv wifi-get-receivers coverage
+  if debug [ if b-type = "pos-convoi" [ set recv (turtle-set one-of drones with-min [who]) ] ]; debug
+
+  if any? recv [
+    let msg create-message b-type
+    
+    set msg add-multiple-receivers (agent-set-to-list recv) msg
+    
+    ; Rajoute le contenu
+    set msg add-content content msg
+
+    ; Rajouter timestamp = ticks et original sender
+    set msg (add-field msg "key:" key)
+    set msg (add-field msg "original-sender:" who)
+    set msg (add-field msg "timestamp:" ticks)
+
+    ; Envoi du message
+    send msg
+  ]
+end
+
+; Relais d'un message qu'on vient juste de recevoir a tous les agents a proximite de nous mais qui n'ont pas recu le message apriori (pas dans la liste des receivers)
+to wifi-relay [coverage msg]
+  ; Relais seulement si le belief timestamp > a ce qu'on a ou qu'il n'existe pas encore
+  let recv wifi-get-receivers coverage
+
+  set recv difference recv (get-receivers msg)
+  set recv difference recv (turtle (get-original-sender msg))
+
+  if any? recv [
+
+    set msg remove-field "receivers" msg
+
+    set msg add-multiple-receivers (agent-set-to-list recv) msg
+
+    ; Envoi du message
+    send msg
+  ]
+end
+
+; Relais differe dans le temps de tous les messages qu'on a recu a un agent qu'on vient de recontacter (vient de retourner dans la zone de couverture wifi alors qu'on l'avait perdu de vue avant)
+; Permet aux agents de se mettre a jour regulierement les uns les autres
+to wifi-update [id] ; id = who du sender du message
+  ; Si ca fait un bout de temps qu'on n'avait pas entendu parler de l'envoyeur, mais que ca fait au moins 2*send-interval (il faut au moins ca car sinon si ca fait send-interval, l'autre peut etre en train de nous envoyer des messages mais on est en train de l'updater avant qu'on ait traité les messages qu'il vient de nous envoyer. 2*send-interval permet d'etre sur qu'on n'a pas vu l'autre depuis au moins un cycle de communication).
+  ;if ntable:has-key? last-seen-time id [ show (word who " " id " " ticks " " ((ntable:get last-seen-time id) + send-interval * 2)) ]
+  if ntable:has-key? last-seen-time id and ticks >= (ntable:get last-seen-time id) + send-interval * 2 [
+    if debug [show (word "Updating friend " id)]
+
+    ;(toujours ordonne du plus ancien au plus nouveau en premier)
+    ;let first-missed-belief min-one-of (beliefs with [(get-field "timestamp" ?) > last-time-seen]) [timestamp]
+    
+    let lts (ntable:get last-seen-time id)
+    let missing-beliefs filter [get-belief-timestamp ? > lts] beliefs
+    
+    ; Conversion des beliefs en message...
+    foreach missing-beliefs [
+
+      ; Conversion de la croyance en message (voir drone-receive-messages pour l'inverse)
+      let msg create-message (belief-type ?)
+      set msg add-receiver id msg
+      set msg add-content (get-belief-content ?) msg
+      set msg (add-field msg "key:" (get-belief-key ?))
+      set msg (add-field msg "original-sender:" (get-belief-original-sender ?))
+      set msg (add-field msg "timestamp:" (get-belief-timestamp ?))
+
+      ; Envoi du message
+      send msg
+    ]
+
+  ]
+end
+
+; Envoi d'un message qu'on genere vers un agent bien precis quelquesoit la distance (utilise pour communiquer avec le QG)
+to wimax-send [receivers b-type key content] ; b-type = performative
+  if any? receivers [
+    let msg create-message b-type
+    
+    set msg add-multiple-receivers (agent-set-to-list receivers) msg
+
+    ; Rajoute le contenu
+    set msg add-content content msg
+
+    ; Rajouter timestamp = ticks et original sender
+    set msg (add-field msg "key:" key)
+    set msg (add-field msg "original-sender:" who)
+    set msg (add-field msg "timestamp:" ticks)
+
+    ; Envoi du message
+    send msg
+  ]
+end
+
+
+
+;=======================
+;     VISUALIZATION
+;=======================
+
+; Placer ici toutes les visualisations
+to visualization
+  ; Pour les drones: leur couleur change selon leur connection avec les autres drones et au QG
+  if n-drones > 0 [
+    ask drones [
+      ifelse dead? [
+        set color red
+      ]
+      [
+        ; Bleu si connecte au convoi
+        ; On detecte soit une connection directe a un leader du convoi, soit avec des beliefs pour detecter s'il y a une chaine de connection, car s'ils sont connectés par l'intermédiaire d'autres drones c'est bon!
+        ifelse (play-mode-enabled? and any? fast-in-radius (convois with [leader?]) wifi-coverage-radius) or
+        any? fast-in-radius-nowrap (convois with [leader?]) wifi-coverage-radius or
+        (not empty? beliefs-of-type "pos-convoi" and ticks <= (get-belief-timestamp read-first-belief-of-type "pos-convoi") + send-interval * 2)  [
+          set color cyan
+        ]
+        ; Orange sinon
+        [
+          set color orange
+        ]
+        ; Et jaune si connecte au QG
+        if not empty? beliefs-of-type "hq-beacon" and ticks <= (get-belief-timestamp read-first-belief-of-type "hq-beacon") + send-interval * 2 [
+          set color yellow
+        ]
+      ]
+    ]
+    
+    ifelse hide-wifi [
+      if not [hidden?] of one-of halos [
+        ask halos [
+          hide-turtle
+        ]
+      ]
+    ]
+    [
+      if [hidden?] of one-of halos [
+        ask halos [
+          show-turtle
+        ]
+      ]
+    ]
+  ]
+end
+
+; Inspector: pour inspecter les agents pendant la simulation (similaire au Mind Inspector dans Jason)
+to follow-convoi [id]
+  if id < n-cars [
+    follow one-of convois with [who = (min [who] of convois) + id]
+  ]
+end
+
+to watch-convoi [id]
+  if id < n-cars [
+    watch one-of convois with [who = (min [who] of convois) + id]
+  ]
+end
+
+to follow-drone [id]
+  if id < n-drones [
+    follow one-of drones with [who = (min [who] of drones) + id]
+  ]
+end
+
+to watch-drone [id]
+  if id < n-drones [
+    watch one-of drones with [who = (min [who] of drones) + id]
+  ]
+end
+
+to inspect-drone [id]
+  if id < n-drones [
+    inspect one-of drones with [who = (min [who] of drones) + id]
+  ]
+end
+
+
+
+;=======================
+;       PLAY MODE
+;=======================
+
+to play-mode
+  user-message "Vous etes en charge de conduire un convoi humanitaire contenant une cargaison critique. Vous devez arriver au but (totem jaune) sans vous faire intercepter par les ennemis. Des drones vous aideront dans votre tache. Bonne chance!"
+
+  play-setup
+end
+
+to play-setup
+  ; Genere un monde jusqu'a ce qu'il soit possible au convoi d'arriver au but
+  let path-is-possible? false
+  while [not path-is-possible?] [
+    clear-all
+    if not debug and not debug-more [no-display] ; disable gui display to speedup processing, the time slider won't influence the setup procedure
+    setup-globals
+    play-setup-globals
+    set-default-shape halos "thin ring"
+    setup-env
+    clear-turtles ; permet de reinit les numeros who
+    setup-convois
+
+    ifelse n-cars <= 0 [
+      set path-is-possible? true
+    ]
+    ; Genere un premier chemin pour voir si c'est bon, sinon on regenere un autre monde
+    [
+      let start-path (plan-astar ([[patch-at 0 0 (pzcor * -1)] of patch-here] of one-of convois with [leader?]) (one-of patches with [objectif?]) false)
+      set as-path replace-item 0 as-path start-path
+      if not empty? start-path [ set path-is-possible? true]
+    ]
+    ask waypoints [ die ] ; on ne veut pas montrer le chemin en mode play!
+  ]
+  if not debug and not debug-more [no-display]
+  setup-drones
+  setup-enemies
+  setup-citizens
+  setup-hq
+
+  setup-precache
+  
+  play-setup-camera
+  display ; reenable gui display
+  reset-ticks
+end
+
+to play-setup-globals
+  set play-mode-enabled? true
+  set p-up false
+  set p-down false
+  set p-left false
+  set p-right false
+  set p-speed 0
+  set p-angle 0
+  set p-cam-mode 0
+end
+
+; Place la camera du joueur sur un des leaders du convoi
+to play-setup-camera
+  let avatar one-of convois with [leader? and not dead?]
+
+  ifelse avatar != nobody [
+    ifelse p-cam-mode = 1 [
+      follow avatar ; va automatiquement allouer l'id de l'agent qu'on suit dans la var "subject"
+    ]
+    [
+      ride avatar ; idem pour subject et who id
+    ]
+  ]
+  ; Sinon pas d'avatar disponible, c'est probablement car la mission est echouee, donc on fait un reset de la camera
+  [ reset-perspective ]
+end
+
+to play-mode-change-view
+  ifelse p-cam-mode = 0 [
+    set p-cam-mode 1
+  ]
+  [
+    set p-cam-mode 0
+  ]
+  play-setup-camera
+end
+
+; Boucle principale faisant tourner la simulation en Play Mode, gerant les inputs du joueur
+to play-mode-go
+  if not debug and not debug-more [no-display] ; disable gui display to speedup processing, the time slider won't influence the setup procedure
+
+  ; Gestion des NPC (personnages non joueurs) - doit etre fait avant les joueurs pour rafraichir les donnees avant (en particulier pour savoir qui est leader convoi pour set la camera)
+  hq-think
+  drones-think
+  enemies-think
+  citizens-think
+  missiles-think
+
+  ; Gestion du joueur
+  if not mission-failed? and not mission-completed? [
+    play-mode-move
+    
+    play-mode-convois-think
+
+    check-mission-completed
+
+    ; Si la voiture qu'on controlait a ete detruite, on change de voiture
+    if subject = nobody or [dead?] of subject [ play-setup-camera ]
+  ]
+  
+  visualization
+
+  tick
+
+  display ; reenable gui display
+
+  if is-movie-recording? [ movie-grab-view ]
+
+  if mission-completed? or mission-failed? [ reset-perspective stop ] ; on reset la camera et on arrete la simulation
+
+  wait (1 - play-mode-speed) / 10
+end
+
+; Gere les voitures cortege qui suivent le joueur et si le joueur a atteint l'objectif
+to play-mode-convois-think
+  ; Deplacement des voitures-cortege: elles ne font que suivre la voiture devant eux (avec laquelle elles sont liées)
+  ask convois with [not leader? and not finished? and not dead?] [
+    ifelse any? my-out-convoi-links [
+      move-convoi ([patch-here] of one-of out-convoi-link-neighbors) true true
+    ]
+    ; S'il n'y a pas de lien devant, c'est probablement que la voiture est morte, donc on devient leader
+    [
+      set leader? true
+      if not to-protect? [ set color orange ]
+    ]
+  ]
+
+  ; Critere d'arret, on est a cote du but?
+  ask convois with [leader?] [
+    check-convoi-finished
+    convoi-send-messages ; important meme dans le play-mode pour que les drones puissent choisir leur strategie
+  ]
+end
+
+; Gere la dynamique de mouvement du joueur, avec inertie et detection de collision avec les obstacles
+to play-mode-move
+  ; Valeurs maximales de vitesse et d'angle
+  ; Note: on doit les assigner a chaque iteration au cas ou l'utilisateur change la vitesse de la simulation en cours de route (avec play-mode-speed)
+  set p-max-speed 0.1 * play-mode-speed
+  set p-max-angle 1 * play-mode-speed
+  ; Valeurs d'incrementation de la vitesse et de l'angle quand l'utilisateur appuie sur une touche
+  let speed-inc 0.01 * play-mode-speed
+  let angle-inc 0.5 * play-mode-speed
+  ; Valeurs d'inertie (diminue la vitesse et l'angle)
+  let speed-dec (speed-inc / 100)
+  let angle-dec (angle-inc / 50)
+
+  ; Commandes joueur
+  ; NOTE: pour pouvoir en meme temps faire tourner la simulation et accepter des inputs, on utilise des boutons qui set des variables. C'est les variables globales ensuite qu'on recupere et qu'on peut utiliser, car meme si la simulation tourne, les variables peuvent etre modifiees (mais on ne peut pas activer une autre procedure tant que celle en cours, play-mode-go, qui est infinie, ne se termine pas).
+  if p-up [
+    set p-speed min (list p-max-speed (p-speed + speed-inc))
+    set p-up false
+  ]
+  if p-down [
+    set p-speed max (list (p-max-speed * -1) (p-speed - speed-inc))
+    set p-down false
+  ]
+  ;if p-left and p-speed != 0 [ ; pas le droit de tourner sans aucune vitesse (non player-friendly si utilise boutons)
+  if p-left [
+    set p-angle max (list (p-max-angle * -1) (p-angle - angle-inc))
+    set p-left false
+  ]
+  ;if p-right and p-speed != 0 [ ; pas le droit de tourner sans aucune vitesse (non player-friendly si utilise boutons)
+  if p-right [
+    set p-angle min (list p-max-angle (p-angle + angle-inc))
+    set p-right false
+  ]
+
+  ; Dynamique d'inertie: on simule une certaine inertie dans le changement de vitesse et d'angle (c'est pas juste pour faire joli, ca aide a jouer puisqu'on ne peut pas appuyer sur deux boutons en meme temps, donc ca permet a la voiture de continuer a avancer pendant qu'on tourne)
+  if p-speed > 0 [ set p-speed p-speed - speed-dec ]
+  if p-speed < 0 [ set p-speed p-speed + speed-dec ]
+  if p-angle > 0 [ set p-angle p-angle - angle-dec ]
+  if p-angle < 0 [ set p-angle p-angle + angle-dec ]
+  ; Rounding errors: NetLogo fait parfois quelques erreurs de calculs sur des tres petits ou tres grand nombres, donc ici si on voit qu'on est proche de 0 mais pas tout a fait a 0, on met a 0 (pour arreter la voiture de continuer a tourner indefiniment)
+  if abs (p-speed - speed-dec) < speed-dec [ set p-speed 0 ] ; si on est proche de 0 mais que la vitesse est en-dessous du seuil d'inertie, on met a 0
+  if abs (p-angle - angle-dec) < angle-dec [ set p-angle 0 ]
+
+  ; Application du mouvement
+  ask subject [
+    set pitch 0
+    set roll 0
+    ; Tourne
+    if p-angle != 0 [rt p-angle]
+    ; Avance, avec detection de collision avec obstacles (n'avance pas)
+    ifelse not [obstacle?] of patch-ahead p-speed [
+      fd p-speed
+    ]
+    ; Sinon collision, on met la vitesse a 0
+    [
+      set p-speed 0
+    ]
+  ]
+end
+
+; Records a .mov video directly from NetLogo
+; Note: this is quite slow, prefer using Fraps or Webinaria
+to record-movie
+  ifelse is-movie-recording? [
+    movie-close
+    set is-movie-recording? false
+  ]
+  [
+    movie-set-frame-rate movie-fps
+    set is-movie-recording? true
+    movie-start (word "recording-" (remove ":" date-and-time) ".mov")
+  ]
+end
+
+
+;=======================
+;     AUX FUNCTIONS
+;=======================
+
+; Recursively print a mega list (recursive list of listes or in fact any other element)
+; Should be used with print, eg: print list:pretty-print-recursive (list (list 1 2) (list 3 4))
+to-report list:pretty-print-recursive [megalist]
+  report list:pretty-print-recursive-aux megalist 1
+end
+ 
+to-report list:pretty-print-recursive-aux [megalist level] ; megalist is a list of listes
+  ifelse is-list? megalist and (is-list? item 0 megalist or is-agent? item 0 megalist) [
+    let n (length megalist)
+    let i 0
+    let text ""
+    let levelstring (word (reduce [word ?1 ?2] (n-values level ["-"])) ">")
+    while [i < n] [
+      set text (word text "\n" (word levelstring i ": " (list:pretty-print-recursive-aux (item i megalist) (level + 1))))
+      set i (i + 1)
+    ]
+    report text
+  ]
+  [
+    if megalist = nobody [
+      report "nobody"
+    ]
+    report megalist
+  ]
+end
+
+; Reporte les 6 voisins sans world wrap
+to-report neighbors6-nowrap
+; reports neighbors-nowrap-n or the indicated size
+report neighbors6 with
+[ abs (pxcor - [pxcor] of myself) <= 1
+  and abs (pycor - [pycor] of myself) <= 1
+]
+end
+
+; Manhattan distance (nombre de cases a parcourir, permet de surestime la distance a parcourir, ce que ne fait pas la distance a vol d'oiseau ou distance euclidienne)
+; Version qui permet d'utiliser deux patchs en arguments
+to-report manhattan-distance2 [patch1 patch2]
+  report abs ([pxcor] of patch1 - [pxcor] of patch2) + abs ([pycor] of patch1 - [pycor] of patch2) + abs ([pzcor] of patch1 - [pzcor] of patch2)
+end
+
+; Manhattan distance (nombre de cases a parcourir, permet de surestime la distance a parcourir, ce que ne fait pas la distance a vol d'oiseau ou distance euclidienne)
+; Version qui fonctionne comme distance de NetLogo
+to-report manhattan-distance [goal]
+  report abs (pxcor - [pxcor] of goal) + abs (pycor - [pycor] of goal) + abs (pzcor - [pzcor] of goal)
+end
+
+to-report manhattan-distance2d [goal]
+  report abs (pxcor - [pxcor] of goal) + abs (pycor - [pycor] of goal)
+end
+
+; Retourne l'ensemble des patchs entre une cible et soi
+; beam-width permet de definir la largeur du trait de patchs qu'on va checker entre l'ennemi et le convoi pour verifier s'il y a un obstacle. Une plus grande valeur = un plus large trait, donc plus de chances de tomber sur un obstacle.
+to-report in-between [objects target beam-width]
+  let dist distance target
+  report objects with [distance target + distance myself < dist + beam-width]
+end
+to-report patches-in-between [target beam-width]
+  report in-between patches target beam-width
+end
+
+; Faster implementation of in-radius than NetLogo native
+to-report fast-in-radius [objects radius]
+  report objects with [distance myself < radius]
+end
+
+; Faster implementation of in-radius-nowrap than NetLogo native
+to-report fast-in-radius-nowrap [objects radius]
+  report objects with [distance-nowrap myself < radius]
+end
+
+to-report intersection [set1 set2]
+  if is-agent? set2 [ set set2 (list set2) ] ; if it's only a single agent and not an agent-set, we convert to a list (not to an agent-set because we don't know if it's a turtle-set, patch-set or link-set)
+  report set1 with [member? self set2]
+end
+
+to-report union [set1 set2]
+  report (patch-set set1 set2)
+end
+
+to-report difference [set1 set2]
+  if is-agent? set2 [ set set2 (list set2) ] ; if it's only a single agent and not an agent-set, we convert to a list (not to an agent-set because we don't know if it's a turtle-set, patch-set or link-set)
+  report set1 with [not member? self set2]
+end
+
+to-report exclusive [set1 set2]
+  if is-agent? set1 [ set set1 (list set1) ] ; if it's only a single agent and not an agent-set, we convert to a list (not to an agent-set because we don't know if it's a turtle-set, patch-set or link-set)
+  if is-agent? set2 [ set set2 (list set2) ]
+  report (patch-set (set1 with [not member? self set2]) (set2 with [not member? self set1]))
+end
+
+; Forward without wrap (cannot hop over world walls)
+to forward-nowrap [number]
+  if distance-nowrap (patch-ahead number) <= (number + 1) [ ; simply check if after hopping forward we will be a lot further than normally
+    fd number
+  ]
+  ;[
+  ;  fd (number / 10) * -1
+  ;]
+end
+to fd-nowrap [number]
+  forward-nowrap number
+end
+
+to-report agent-set-to-list [agent-set]
+  ;report sort agent-set ;; list sorted by default agent order (e.g. by who-number)
+  ;report sort-by [ criteria ] agent-set ;; list sorted by user-defined order
+  if not any? agent-set [ report [] ]
+  report [ self ] of agent-set ;; list, in randomized order
+end
+
+to-report list-to-agent-set [L]
+  if is-list? L and empty? L [ report no-turtles ]
+  ifelse is-turtle? (item 0 L)
+  [ report turtles with [member? self L] ]
+  [
+    ifelse is-link? (item 0 L)
+    [ report links with [member? self L] ]
+    [ report patches with [member? self L] ]
+    ]
+end
+
+; Seuillage d'une valeur entre deux limites (minimum et maximum). Tres utile pour simuler les angles de rotation d'un vehicule.
+to-report limit-range [range number]
+  ifelse number > range
+  [ set number range ]
+  [ if number < (range * -1) [ set number (range * -1) ] ]
+  report number
+end
+
+; Pure NetLogo implementation of table (limited functionalities compared to the original extension)
+to-report ntable:make
+  report []
+end
+
+to-report ntable:put [table key content]
+  ifelse ntable:has-key? table key
+  [ report replace-item (ntable:find-key-pos table key) table (list key content) ]
+  [ report sort-by [first ?1 < first ?2] lput (list key content) table ]
+end
+
+to-report ntable:get [table key]
+  report last first filter [first ? = key] table
+end
+
+to-report ntable:get-full [table key]
+  report first filter [first ? = key] table
+end
+
+to-report ntable:has-key? [table key]
+  report not empty? filter [first ? = key] table
+end
+
+to-report ntable:find-key-pos [table key]
+  report position (ntable:get-full table key) table
+end
+@#$#@#$#@
+GRAPHICS-WINDOW
+0
+0
+1075
+1096
+-1
+-1
+15.0
+1
+10
+1
+1
+1
+0
+1
+1
+1
+0
+70
+0
+70
+0
+10
+1
+0
+1
+ticks
+30.0
+
+BUTTON
+0
+560
+65
+593
+NIL
+setup
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+0
+630
+65
+663
+NIL
+go
+T
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+SWITCH
+15
+780
+140
+813
+show-intentions
+show-intentions
+0
+1
+-1000
+
+SWITCH
+15
+810
+140
+843
+show_messages
+show_messages
+1
+1
+-1000
+
+INPUTBOX
+235
+560
+300
+620
+n-rivers
+2
+1
+0
+Number
+
+SWITCH
+345
+690
+440
+723
+astar-visu
+astar-visu
+0
+1
+-1000
+
+SWITCH
+15
+720
+105
+753
+debug
+debug
+1
+1
+-1000
+
+INPUTBOX
+410
+560
+501
+620
+astar-max-depth
+10000
+1
+0
+Number
+
+SWITCH
+15
+750
+120
+783
+debug-more
+debug-more
+1
+1
+-1000
+
+SWITCH
+345
+620
+465
+653
+astar-longpath
+astar-longpath
+0
+1
+-1000
+
+INPUTBOX
+345
+560
+410
+620
+astar-faster
+20
+1
+0
+Number
+
+TEXTBOX
+385
+530
+495
+555
+Convoy
+20
+0.0
+1
+
+TEXTBOX
+155
+530
+305
+551
+Environment
+20
+0.0
+1
+
+INPUTBOX
+110
+560
+185
+620
+n-mountains
+4
+1
+0
+Number
+
+INPUTBOX
+185
+560
+235
+620
+n-lakes
+2
+1
+0
+Number
+
+INPUTBOX
+215
+620
+275
+680
+n-enemies
+5
+1
+0
+Number
+
+INPUTBOX
+275
+620
+335
+680
+n-citizens
+5
+1
+0
+Number
+
+INPUTBOX
+160
+620
+215
+680
+n-drones
+6
+1
+0
+Number
+
+INPUTBOX
+110
+620
+160
+680
+n-cars
+8
+1
+0
+Number
+
+TEXTBOX
+25
+685
+90
+710
+Debug
+20
+0.0
+1
+
+SWITCH
+345
+725
+470
+758
+astar-visu-more
+astar-visu-more
+1
+1
+-1000
+
+BUTTON
+15
+850
+80
+883
+NIL
+split-convoi
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+BUTTON
+210
+710
+285
+743
+follow-convoi
+follow-convoi rconvoi
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+INPUTBOX
+285
+710
+335
+770
+rconvoi
+0
+1
+0
+Number
+
+BUTTON
+210
+780
+285
+813
+follow-drone
+follow-drone rdrone
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+INPUTBOX
+285
+795
+335
+855
+rdrone
+1
+1
+0
+Number
+
+BUTTON
+15
+885
+130
+918
+NIL
+drones-landing-debug
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+BUTTON
+0
+595
+65
+628
+1-step
+repeat 5 [go]
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+BUTTON
+185
+195
+247
+228
+^
+set p-up true
+NIL
+1
+T
+OBSERVER
+NIL
+Z
+NIL
+NIL
+0
+
+BUTTON
+185
+230
+247
+263
+v
+set p-down true
+NIL
+1
+T
+OBSERVER
+NIL
+S
+NIL
+NIL
+0
+
+BUTTON
+120
+210
+183
+243
+<
+set p-left true
+NIL
+1
+T
+OBSERVER
+NIL
+Q
+NIL
+NIL
+0
+
+BUTTON
+250
+210
+313
+243
+>
+set p-right true
+NIL
+1
+T
+OBSERVER
+NIL
+D
+NIL
+NIL
+0
+
+BUTTON
+145
+160
+220
+193
+Init playmode
+play-mode
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+210
+840
+285
+873
+inspect-drone
+inspect-drone rdrone
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+MONITOR
+20
+140
+75
+177
+Drones lost
+(word count drones with [dead?] \"/\" n-drones)
+0
+1
+9
+
+TEXTBOX
+25
+110
+75
+131
+Stats
+20
+0.0
+1
+
+TEXTBOX
+385
+765
+465
+790
+Enemies
+20
+0.0
+1
+
+SLIDER
+350
+790
+495
+823
+precision-enemies
+precision-enemies
+0
+1
+0.2
+0.1
+1
+NIL
+HORIZONTAL
+
+INPUTBOX
+350
+825
+400
+885
+e-ammo
+10
+1
+0
+Number
+
+MONITOR
+20
+175
+75
+212
+Cars lost
+(word count convois with [dead?] \"/\" n-cars)
+0
+1
+9
+
+TEXTBOX
+230
+685
+315
+706
+Inspector
+20
+0.0
+1
+
+TEXTBOX
+170
+130
+265
+155
+Play mode
+20
+0.0
+1
+
+SWITCH
+345
+655
+465
+688
+astar-randpath
+astar-randpath
+1
+1
+-1000
+
+BUTTON
+220
+160
+282
+193
+Play!
+play-mode-go
+T
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+TEXTBOX
+545
+535
+610
+556
+Drones
+20
+0.0
+1
+
+INPUTBOX
+510
+595
+650
+655
+wifi-coverage-radius
+20
+1
+0
+Number
+
+BUTTON
+250
+245
+320
+278
+Change view
+play-mode-change-view
+NIL
+1
+T
+OBSERVER
+NIL
+C
+NIL
+NIL
+0
+
+SWITCH
+510
+560
+600
+593
+no-wifi
+no-wifi
+1
+1
+-1000
+
+INPUTBOX
+585
+700
+655
+760
+d-ammo
+20
+1
+0
+Number
+
+INPUTBOX
+655
+700
+725
+760
+d-fuel
+500
+1
+0
+Number
+
+CHOOSER
+510
+655
+647
+700
+exploration-strategy
+exploration-strategy
+"random-move" "circular-move" "astar-move"
+2
+
+TEXTBOX
+650
+670
+800
+688
+<-- Only if Debug = On
+11
+0.0
+1
+
+INPUTBOX
+400
+825
+475
+885
+e-sight-radius
+9
+1
+0
+Number
+
+INPUTBOX
+510
+700
+585
+760
+d-sight-radius
+12
+1
+0
+Number
+
+INPUTBOX
+510
+760
+605
+820
+strategy-timelimit
+200
+1
+0
+Number
+
+BUTTON
+120
+245
+182
+278
+kill
+ask subject [ convoi-kill ]
+NIL
+1
+T
+OBSERVER
+NIL
+K
+NIL
+NIL
+0
+
+MONITOR
+20
+210
+75
+247
+Missiles
+count missiles
+0
+1
+9
+
+INPUTBOX
+395
+885
+475
+945
+e-shot-interval
+30
+1
+0
+Number
+
+SWITCH
+15
+920
+105
+953
+slow-mo
+slow-mo
+1
+1
+-1000
+
+SWITCH
+15
+955
+120
+988
+hide-missiles
+hide-missiles
+1
+1
+-1000
+
+BUTTON
+5
+990
+80
+1023
+drone-ascend
+if any? drones with [pzcor < hauteAlt and not dead?] [ ask one-of drones with [pzcor < hauteAlt and not dead?] [ drone-ascend ] ]
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+BUTTON
+80
+990
+160
+1023
+drone-descend
+if any? drones with [pzcor >= hauteAlt and not dead?] [ ask one-of drones with [pzcor >= hauteAlt and not dead?] [ drone-descend ] ]
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+BUTTON
+5
+1020
+160
+1053
+drone-contact-hq-debug
+drone-contact-hq-debug
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+0
+
+SLIDER
+510
+820
+650
+853
+hauteAltSpeedMod
+hauteAltSpeedMod
+0
+1
+0.4
+0.1
+1
+NIL
+HORIZONTAL
+
+SWITCH
+15
+1050
+135
+1083
+hq-always-yes
+hq-always-yes
+0
+1
+-1000
+
+SWITCH
+510
+855
+635
+888
+d-scatter-solve1
+d-scatter-solve1
+0
+1
+-1000
+
+TEXTBOX
+640
+855
+790
+911
+Resolution of the scatter problem using CPS (drones try to correct their trajectories to maintain connectivity)
+11
+0.0
+1
+
+SWITCH
+600
+560
+690
+593
+hide-wifi
+hide-wifi
+0
+1
+-1000
+
+INPUTBOX
+510
+890
+590
+950
+d-group-attack
+1
+1
+0
+Number
+
+INPUTBOX
+605
+760
+725
+820
+radius-circular-strategy
+7
+1
+0
+Number
+
+MONITOR
+20
+245
+85
+282
+Enemies dead
+(word count enemies with [dead?] \"/\" n-enemies)
+0
+1
+9
+
+MONITOR
+20
+280
+85
+317
+Citizens dead
+(word count citizens with [dead?] \"/\" n-citizens)
+0
+1
+9
+
+BUTTON
+210
+740
+285
+773
+watch-convoi
+watch-convoi rconvoi
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+210
+810
+285
+843
+watch-drone
+watch-drone rdrone
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+SWITCH
+15
+1085
+140
+1118
+watch-grouping
+watch-grouping
+1
+1
+-1000
+
+MONITOR
+20
+315
+85
+352
+Pacifists dead
+count citizens with [dead? and not i-am-agressive?]
+0
+1
+9
+
+MONITOR
+20
+350
+95
+387
+Agressive citizens
+count citizens with [i-am-agressive?]
+0
+1
+9
+
+BUTTON
+160
+280
+275
+313
+Drone scout forward!
+drone-scout-forward true
+NIL
+1
+T
+OBSERVER
+NIL
+E
+NIL
+NIL
+1
+
+BUTTON
+10
+1130
+85
+1163
+Record movie
+record-movie
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+INPUTBOX
+85
+1120
+145
+1180
+movie-fps
+25
+1
+0
+Number
+
+SLIDER
+130
+320
+302
+353
+play-mode-speed
+play-mode-speed
+0
+1
+0.9
+0.05
+1
+NIL
+HORIZONTAL
+
+SLIDER
+65
+535
+98
+681
+simu-speed
+simu-speed
+1
+9
+3
+1
+1
+NIL
+VERTICAL
+
+TEXTBOX
+10
+10
+980
+40
+========== PLAY MODE ==========
+30
+0.0
+1
+
+TEXTBOX
+15
+45
+630
+100
+How to play: you take the control of the convoy leader. You must reach the goal (the floating yellow cube) while ensuring that your golden car does not get captured by an enemy.\nDrones will help you in your task automatically, but you can also send them scout forward if you want to be prudent!
+15
+0.0
+1
+
+TEXTBOX
+355
+160
+620
+340
+First click on the Init playmode button, then click on Play!\n\nYou can use your keyboard keys ZQSD to move around. You are free to change the key bindings by right clicking on the keys and then Edit and then change the Action Key box.\n\nYou can Change View by pressing C, and you can unzoom by left-clicking and dragging on the 3D visualization window.
+13
+0.0
+1
+
+TEXTBOX
+0
+395
+635
+430
+========== SIMULATION ==========
+30
+0.0
+1
+
+TEXTBOX
+5
+430
+655
+505
+What is it: it's the fully automatic simulation, where the convoy is simulated by Weighted A*.\n\nHow to use: Click on Setup then on the Go button to launch the simulation. You can also play with the parameters, and with simu-speed to speedup the simulations (if it's too slow on your machine).
+15
+0.0
+1
+
+@#$#@#$#@
+## WHAT IS IT?
+
+This is a multi-agents system simulating a civil drones mission, where they have to escort and protect a humanitarian convoy transporting a critical cargo (the yellow car).
+
+Enemies will try to destroy cars, drones and capture the cargo. Drones must avoid that at all costs.
+
+Mission is failed if an enemy capture the cargo. Success if the cargo can attain the objective (yellow floating cube).
+
+The environment is dynamic, ever changing and thus the drones cannot know in advance what will happen on the field, nor who are foes or friends.
+
+There is also not any central system to organize them, thus they have to work in a decentralized manner.
+
+## HOW IT WORKS
+
+The environment is dynamically generated with obstacles and topological items (mountains, ponds, rivers and bridges to cross the rivers).
+
+There is also a basic physics model which try to input some realism to the simulation, by detecting collisions and by limiting speed and turn angles of the vehicles like the convoy and the drones.
+
+Convoy is simulating a human behavior by planing a path respecting the topology by using a Weighted A* algorithm. Under attack, the convoy will split in two, with the first part continuing on the same path, but the second one trying another route while the first part is diverting the enemy.
+
+Enemies are either mobile or immobile and will try to kill drones at first sight, then the cars of the convoy, and then try to capture the cargo (not necessarily in that order by if they can choose it will be in this order).
+
+Citizens are sorts of jokers: they can either be pacifists or aggressive, in which case they will try to shoot drones and cars just like enemies do.
+
+Drones are the core of the simulation, since all other agents are just mockups of human behaviors: they communicate in a decentralized, P2P fashion by relaying and replaying their beliefs to their comrades. Drones use the BDI architecture and FIPA ACL protocol to communicate their beliefs. Thus they only have local knowledge of their environment, and relies heavily on the group rather than on their own (eg: they can believe the convoy is somewhere but actually it has moved a lot since then, then the drone can be lost unless another drone updates its beliefs about the new position of the convoy). The convoy updates the drones regularly with its position.
+
+Another thing to know is that drones (and convoy) have a limited wifi range of communication, thus they can't always discuss and share with each other. That's why a communication mechanism we call broadcast/relay/replay has been implemented to circumvent problems that can arise, along with the CPS algorithm to try to maintain connectivity between the drones.
+
+Drones will use several patrol and exploration strategies to keep the convoy safe: path-ahead exploration, circular patrol around the convoy leader, random exploration and scout forward. One drone (randomly chosen) must always stay around the convoy (to relay informations to others and to watch over the convoy), the other drones will negociate and choose their own strategy in a decentralized fashion.
+
+Drones also have limited resources and thus must manage them, like fuel and munitions. Once they risk to run out of fuel or munition, they will go to the base to recharge.
+
+Drones will instinctively avoid enemies (like birds or insects), but will try to identify the threats: first visually (by comparing the NetLogo shape), then if that doesn't work by behavior (using a simple multi-critera decision by agregating several criterions like if the individual carry munitions and thus weapons, if it's in ambush on the A* path of the convoy, etc.). Basically, enemies are detectable by image, dangerous citizens are only detectable by behavior.
+
+To attack the enemy, drones can either attack alone or by group. In such a case, a Contract-Net will be initiated to find drones that are available for the task, the drones will then regroup and then go kill the enemy together.
+
+## HOW TO USE IT
+
+Too many parameters are available in the GUI to be able to describe them all here, but hopefully most of their names are self-explanatory, and a simple quickstart is provided directly in the interface.
+
+## THINGS TO NOTICE
+
+Look closely when drones go to refill at the base and when they come back: often they will go to a deprecated position of the convoy, but as soon as they reach the communication range of a fellow drone (disable hide-wifi to see the communication ring), they will all converge towards the correct convoy position.
+
+## THINGS TO TRY
+
+Try any combination of the parameters, they should all work together. Also you can try to enable some of the debug switch and parameters, they will highlight some interesting stuff that are running behind the scene (like the A* path construction that you can completely unveil by enabling debug-more + astar-visu + astar-visu-more).
+
+## EXTENDING THE MODEL
+
+Fix the grouped attack, sometimes drones are not efficient and they regroup for nothing until the strategy timelimit is hit (all strategy will stop after some number of ticks).
+
+## NETLOGO FEATURES
+
+See the AUX FUNCTIONS in the code, we implemented a lot of generic codes that can be reused in any NetLogo project, like ensemblist operations like union, difference and exclusive, and also forward-nowrap, and more importantly the patches-in-between and fast-in-radius and fast-in-radius-nowrap which are pure NetLogo but faster implementations than native in-radius command.
+
+Also you can checkout how the play-mode was made, since it allows the player to play in a NetLogo model that keeps on running when user is not pressing a key. For this we used variables, since the play-mode-go loop is never ending, the only way to take into account user's inputs is to change a global variable, either by using a button calling a procedure (which is what we've done here), either by using a switch.
+
+## CREDITS AND REFERENCES
+
+Drones escort mission of a convoy using a decentralized model of communications, by Stephen Larroque, Olivier Hotel
+http://github.com/LRQ3000/netlogo-mas-drones
+
+Using the excellent BDI+FIPA NetLogo extension: Enhancing NetLogo to simulate BDI communicating agents, 2008, Sakellariou, I., Kefalas, P., & Stamatopoulou, I. In Artificial Intelligence: Theories, Models and Applications (pp. 263-275). Springer Berlin Heidelberg.
+
+And the CPS algorithm: Connectivity-Preserving Scattering of Mobile Robots with Limited Visibility, 2010, Taisuke Izumi, Maria Gradinariu Potop-Butucaru, Sébastien Tixeuil, SSS 2010: 319-331
+@#$#@#$#@
+default
+true
+0
+Polygon -7500403 true true 150 5 40 250 150 205 260 250
+
+airplane
+true
+0
+Polygon -7500403 true true 150 0 135 15 120 60 120 105 15 165 15 195 120 180 135 240 105 270 120 285 150 270 180 285 210 270 165 240 180 180 285 195 285 165 180 105 180 60 165 15
+
+arrow
+true
+0
+Polygon -7500403 true true 150 0 0 150 105 150 105 293 195 293 195 150 300 150
+
+box
+false
+0
+Polygon -7500403 true true 150 285 285 225 285 75 150 135
+Polygon -7500403 true true 150 135 15 75 150 15 285 75
+Polygon -7500403 true true 15 75 15 225 150 285 150 135
+Line -16777216 false 150 285 150 135
+Line -16777216 false 150 135 15 75
+Line -16777216 false 150 135 285 75
+
+bug
+true
+0
+Circle -7500403 true true 96 182 108
+Circle -7500403 true true 110 127 80
+Circle -7500403 true true 110 75 80
+Line -7500403 true 150 100 80 30
+Line -7500403 true 150 100 220 30
+
+bulldozer top
+true
+0
+Rectangle -7500403 true true 195 60 255 255
+Rectangle -16777216 false false 195 60 255 255
+Rectangle -7500403 true true 45 60 105 255
+Rectangle -16777216 false false 45 60 105 255
+Line -16777216 false 45 75 255 75
+Line -16777216 false 45 105 255 105
+Line -16777216 false 45 60 255 60
+Line -16777216 false 45 240 255 240
+Line -16777216 false 45 225 255 225
+Line -16777216 false 45 195 255 195
+Line -16777216 false 45 150 255 150
+Polygon -1184463 true true 90 60 75 90 75 240 120 255 180 255 225 240 225 90 210 60
+Polygon -16777216 false false 225 90 210 60 211 246 225 240
+Polygon -16777216 false false 75 90 90 60 89 246 75 240
+Polygon -16777216 false false 89 247 116 254 183 255 211 246 211 211 90 210
+Rectangle -16777216 false false 90 60 210 90
+Rectangle -1184463 true true 180 30 195 90
+Rectangle -16777216 false false 105 30 120 90
+Rectangle -1184463 true true 105 45 120 90
+Rectangle -16777216 false false 180 45 195 90
+Polygon -16777216 true false 195 105 180 120 120 120 105 105
+Polygon -16777216 true false 105 199 120 188 180 188 195 199
+Polygon -16777216 true false 195 120 180 135 180 180 195 195
+Polygon -16777216 true false 105 120 120 135 120 180 105 195
+Line -1184463 true 105 165 195 165
+Circle -16777216 true false 113 226 14
+Polygon -1184463 true true 105 15 60 30 60 45 240 45 240 30 195 15
+Polygon -16777216 false false 105 15 60 30 60 45 240 45 240 30 195 15
+
+butterfly
+true
+0
+Polygon -7500403 true true 150 165 209 199 225 225 225 255 195 270 165 255 150 240
+Polygon -7500403 true true 150 165 89 198 75 225 75 255 105 270 135 255 150 240
+Polygon -7500403 true true 139 148 100 105 55 90 25 90 10 105 10 135 25 180 40 195 85 194 139 163
+Polygon -7500403 true true 162 150 200 105 245 90 275 90 290 105 290 135 275 180 260 195 215 195 162 165
+Polygon -16777216 true false 150 255 135 225 120 150 135 120 150 105 165 120 180 150 165 225
+Circle -16777216 true false 135 90 30
+Line -16777216 false 150 105 195 60
+Line -16777216 false 150 105 105 60
+
+car
+false
+0
+Polygon -7500403 true true 300 180 279 164 261 144 240 135 226 132 213 106 203 84 185 63 159 50 135 50 75 60 0 150 0 165 0 225 300 225 300 180
+Circle -16777216 true false 180 180 90
+Circle -16777216 true false 30 180 90
+Polygon -16777216 true false 162 80 132 78 134 135 209 135 194 105 189 96 180 89
+Circle -7500403 true true 47 195 58
+Circle -7500403 true true 195 195 58
+
+circle
+false
+0
+Circle -7500403 true true 0 0 300
+
+circle 2
+false
+0
+Circle -7500403 true true 0 0 300
+Circle -16777216 true false 30 30 240
+
+cow
+false
+0
+Polygon -7500403 true true 200 193 197 249 179 249 177 196 166 187 140 189 93 191 78 179 72 211 49 209 48 181 37 149 25 120 25 89 45 72 103 84 179 75 198 76 252 64 272 81 293 103 285 121 255 121 242 118 224 167
+Polygon -7500403 true true 73 210 86 251 62 249 48 208
+Polygon -7500403 true true 25 114 16 195 9 204 23 213 25 200 39 123
+
+cylinder
+false
+0
+Circle -7500403 true true 0 0 300
+
+dot
+false
+0
+Circle -7500403 true true 90 90 120
+
+face happy
+false
+0
+Circle -7500403 true true 8 8 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Polygon -16777216 true false 150 255 90 239 62 213 47 191 67 179 90 203 109 218 150 225 192 218 210 203 227 181 251 194 236 217 212 240
+
+face neutral
+false
+0
+Circle -7500403 true true 8 7 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Rectangle -16777216 true false 60 195 240 225
+
+face sad
+false
+0
+Circle -7500403 true true 8 8 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Polygon -16777216 true false 150 168 90 184 62 210 47 232 67 244 90 220 109 205 150 198 192 205 210 220 227 242 251 229 236 206 212 183
+
+fire
+false
+0
+Polygon -7500403 true true 151 286 134 282 103 282 59 248 40 210 32 157 37 108 68 146 71 109 83 72 111 27 127 55 148 11 167 41 180 112 195 57 217 91 226 126 227 203 256 156 256 201 238 263 213 278 183 281
+Polygon -955883 true false 126 284 91 251 85 212 91 168 103 132 118 153 125 181 135 141 151 96 185 161 195 203 193 253 164 286
+Polygon -2674135 true false 155 284 172 268 172 243 162 224 148 201 130 233 131 260 135 282
+
+fish
+false
+0
+Polygon -1 true false 44 131 21 87 15 86 0 120 15 150 0 180 13 214 20 212 45 166
+Polygon -1 true false 135 195 119 235 95 218 76 210 46 204 60 165
+Polygon -1 true false 75 45 83 77 71 103 86 114 166 78 135 60
+Polygon -7500403 true true 30 136 151 77 226 81 280 119 292 146 292 160 287 170 270 195 195 210 151 212 30 166
+Circle -16777216 true false 215 106 30
+
+flag
+false
+0
+Rectangle -7500403 true true 60 15 75 300
+Polygon -7500403 true true 90 150 270 90 90 30
+Line -7500403 true 75 135 90 135
+Line -7500403 true 75 45 90 45
+
+flower
+false
+0
+Polygon -10899396 true false 135 120 165 165 180 210 180 240 150 300 165 300 195 240 195 195 165 135
+Circle -7500403 true true 85 132 38
+Circle -7500403 true true 130 147 38
+Circle -7500403 true true 192 85 38
+Circle -7500403 true true 85 40 38
+Circle -7500403 true true 177 40 38
+Circle -7500403 true true 177 132 38
+Circle -7500403 true true 70 85 38
+Circle -7500403 true true 130 25 38
+Circle -7500403 true true 96 51 108
+Circle -16777216 true false 113 68 74
+Polygon -10899396 true false 189 233 219 188 249 173 279 188 234 218
+Polygon -10899396 true false 180 255 150 210 105 210 75 240 135 240
+
+house
+false
+0
+Rectangle -7500403 true true 45 120 255 285
+Rectangle -16777216 true false 120 210 180 285
+Polygon -7500403 true true 15 120 150 15 285 120
+Line -16777216 false 30 120 270 120
+
+leaf
+false
+0
+Polygon -7500403 true true 150 210 135 195 120 210 60 210 30 195 60 180 60 165 15 135 30 120 15 105 40 104 45 90 60 90 90 105 105 120 120 120 105 60 120 60 135 30 150 15 165 30 180 60 195 60 180 120 195 120 210 105 240 90 255 90 263 104 285 105 270 120 285 135 240 165 240 180 270 195 240 210 180 210 165 195
+Polygon -7500403 true true 135 195 135 240 120 255 105 255 105 285 135 285 165 240 165 195
+
+line
+true
+0
+Line -7500403 true 150 0 150 300
+
+line half
+true
+0
+Line -7500403 true 150 0 150 150
+
+pentagon
+false
+0
+Polygon -7500403 true true 150 15 15 120 60 285 240 285 285 120
+
+person
+false
+0
+Circle -7500403 true true 110 5 80
+Polygon -7500403 true true 105 90 120 195 90 285 105 300 135 300 150 225 165 300 195 300 210 285 180 195 195 90
+Rectangle -7500403 true true 127 79 172 94
+Polygon -7500403 true true 195 90 240 150 225 180 165 105
+Polygon -7500403 true true 105 90 60 150 75 180 135 105
+
+person soldier
+false
+5
+Rectangle -2064490 true false 127 79 172 94
+Polygon -10899396 true true 105 90 60 195 90 210 135 105
+Polygon -10899396 true true 195 90 240 195 210 210 165 105
+Circle -2064490 true false 110 5 80
+Polygon -10899396 true true 105 90 120 195 90 285 105 300 135 300 150 225 165 300 195 300 210 285 180 195 195 90
+Polygon -6459832 true false 120 90 105 90 180 195 180 165
+Line -6459832 false 109 105 139 105
+Line -6459832 false 122 125 151 117
+Line -6459832 false 137 143 159 134
+Line -6459832 false 158 179 181 158
+Line -6459832 false 146 160 169 146
+Rectangle -6459832 true false 120 193 180 201
+Polygon -6459832 true false 122 4 107 16 102 39 105 53 148 34 192 27 189 17 172 2 145 0
+Polygon -955883 true false 183 90 240 15 247 22 193 90
+Rectangle -6459832 true false 114 187 128 208
+Rectangle -6459832 true false 177 187 191 208
+
+plant
+false
+0
+Rectangle -7500403 true true 135 90 165 300
+Polygon -7500403 true true 135 255 90 210 45 195 75 255 135 285
+Polygon -7500403 true true 165 255 210 210 255 195 225 255 165 285
+Polygon -7500403 true true 135 180 90 135 45 120 75 180 135 210
+Polygon -7500403 true true 165 180 165 210 225 180 255 120 210 135
+Polygon -7500403 true true 135 105 90 60 45 45 75 105 135 135
+Polygon -7500403 true true 165 105 165 135 225 105 255 45 210 60
+Polygon -7500403 true true 135 90 120 45 150 15 180 45 165 90
+
+sheep
+false
+15
+Circle -1 true true 203 65 88
+Circle -1 true true 70 65 162
+Circle -1 true true 150 105 120
+Polygon -7500403 true false 218 120 240 165 255 165 278 120
+Circle -7500403 true false 214 72 67
+Rectangle -1 true true 164 223 179 298
+Polygon -1 true true 45 285 30 285 30 240 15 195 45 210
+Circle -1 true true 3 83 150
+Rectangle -1 true true 65 221 80 296
+Polygon -1 true true 195 285 210 285 210 240 240 210 195 210
+Polygon -7500403 true false 276 85 285 105 302 99 294 83
+Polygon -7500403 true false 219 85 210 105 193 99 201 83
+
+square
+false
+0
+Rectangle -7500403 true true 30 30 270 270
+
+square 2
+false
+0
+Rectangle -7500403 true true 30 30 270 270
+Rectangle -16777216 true false 60 60 240 240
+
+star
+false
+0
+Polygon -7500403 true true 151 1 185 108 298 108 207 175 242 282 151 216 59 282 94 175 3 108 116 108
+
+tank
+true
+0
+Rectangle -7500403 true true 144 0 159 105
+Rectangle -6459832 true false 195 45 255 255
+Rectangle -16777216 false false 195 45 255 255
+Rectangle -6459832 true false 45 45 105 255
+Rectangle -16777216 false false 45 45 105 255
+Line -16777216 false 45 75 255 75
+Line -16777216 false 45 105 255 105
+Line -16777216 false 45 60 255 60
+Line -16777216 false 45 240 255 240
+Line -16777216 false 45 225 255 225
+Line -16777216 false 45 195 255 195
+Line -16777216 false 45 150 255 150
+Polygon -7500403 true true 90 60 60 90 60 240 120 255 180 255 240 240 240 90 210 60
+Rectangle -16777216 false false 135 105 165 120
+Polygon -16777216 false false 135 120 105 135 101 181 120 225 149 234 180 225 199 182 195 135 165 120
+Polygon -16777216 false false 240 90 210 60 211 246 240 240
+Polygon -16777216 false false 60 90 90 60 89 246 60 240
+Polygon -16777216 false false 89 247 116 254 183 255 211 246 211 237 89 236
+Rectangle -16777216 false false 90 60 210 90
+Rectangle -16777216 false false 143 0 158 105
+
+target
+false
+0
+Circle -7500403 true true 0 0 300
+Circle -16777216 true false 30 30 240
+Circle -7500403 true true 60 60 180
+Circle -16777216 true false 90 90 120
+Circle -7500403 true true 120 120 60
+
+thin ring
+false
+0
+Circle -7500403 false true 0 0 300
+
+tree
+false
+0
+Circle -7500403 true true 118 3 94
+Rectangle -6459832 true false 120 195 180 300
+Circle -7500403 true true 65 21 108
+Circle -7500403 true true 116 41 127
+Circle -7500403 true true 45 90 120
+Circle -7500403 true true 104 74 152
+
+triangle
+false
+0
+Polygon -7500403 true true 150 30 15 255 285 255
+
+triangle 2
+false
+0
+Polygon -7500403 true true 150 30 15 255 285 255
+Polygon -16777216 true false 151 99 225 223 75 224
+
+truck
+false
+0
+Rectangle -7500403 true true 4 45 195 187
+Polygon -7500403 true true 296 193 296 150 259 134 244 104 208 104 207 194
+Rectangle -1 true false 195 60 195 105
+Polygon -16777216 true false 238 112 252 141 219 141 218 112
+Circle -16777216 true false 234 174 42
+Rectangle -7500403 true true 181 185 214 194
+Circle -16777216 true false 144 174 42
+Circle -16777216 true false 24 174 42
+Circle -7500403 false true 24 174 42
+Circle -7500403 false true 144 174 42
+Circle -7500403 false true 234 174 42
+
+turret
+false
+0
+Rectangle -7500403 true true 105 120 135 255
+Rectangle -7500403 true true 15 180 240 255
+Polygon -7500403 true true 195 30 285 0 300 30 210 60
+Rectangle -7500403 true true 15 30 225 135
+Circle -7500403 true true 33 213 85
+Circle -7500403 true true 133 208 95
+
+turtle
+true
+0
+Polygon -10899396 true false 215 204 240 233 246 254 228 266 215 252 193 210
+Polygon -10899396 true false 195 90 225 75 245 75 260 89 269 108 261 124 240 105 225 105 210 105
+Polygon -10899396 true false 105 90 75 75 55 75 40 89 31 108 39 124 60 105 75 105 90 105
+Polygon -10899396 true false 132 85 134 64 107 51 108 17 150 2 192 18 192 52 169 65 172 87
+Polygon -10899396 true false 85 204 60 233 54 254 72 266 85 252 107 210
+Polygon -7500403 true true 119 75 179 75 209 101 224 135 220 225 175 261 128 261 81 224 74 135 88 99
+
+wheel
+false
+0
+Circle -7500403 true true 3 3 294
+Circle -16777216 true false 30 30 240
+Line -7500403 true 150 285 150 15
+Line -7500403 true 15 150 285 150
+Circle -7500403 true true 120 120 60
+Line -7500403 true 216 40 79 269
+Line -7500403 true 40 84 269 221
+Line -7500403 true 40 216 269 79
+Line -7500403 true 84 40 221 269
+
+wolf
+false
+0
+Polygon -16777216 true false 253 133 245 131 245 133
+Polygon -7500403 true true 2 194 13 197 30 191 38 193 38 205 20 226 20 257 27 265 38 266 40 260 31 253 31 230 60 206 68 198 75 209 66 228 65 243 82 261 84 268 100 267 103 261 77 239 79 231 100 207 98 196 119 201 143 202 160 195 166 210 172 213 173 238 167 251 160 248 154 265 169 264 178 247 186 240 198 260 200 271 217 271 219 262 207 258 195 230 192 198 210 184 227 164 242 144 259 145 284 151 277 141 293 140 299 134 297 127 273 119 270 105
+Polygon -7500403 true true -1 195 14 180 36 166 40 153 53 140 82 131 134 133 159 126 188 115 227 108 236 102 238 98 268 86 269 92 281 87 269 103 269 113
+
+x
+false
+0
+Polygon -7500403 true true 270 75 225 30 30 225 75 270
+Polygon -7500403 true true 30 75 75 30 270 225 225 270
+
+@#$#@#$#@
+NetLogo 3D 5.0.5
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+default
+0.0
+-0.2 0 0.0 1.0
+0.0 1 1.0 0.0
+0.2 0 0.0 1.0
+link direction
+true
+0
+Line -7500403 true 150 150 90 180
+Line -7500403 true 150 150 210 180
+
+@#$#@#$#@
+1
+@#$#@#$#@

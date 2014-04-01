@@ -1,0 +1,179 @@
+;;; File to be included in NetLogo Mutliagent Models
+;;; BDI Architecture for NetLogo Models
+;;; Includes belief revision procedures and Intentions Handling and Execution.
+;;; Original Version for Netlogo 2 (2005) I. Sakellariou
+;;; Adapted to NetLogo 4 (2008) I. Sakellariou
+
+;;; Requirements
+;;; 1) All agents that modeled as "BDI" agent have two declared -own variables beliefs intentions.
+;;; These are the variables to which all beliefs and intentions are recorded. So, in your model if there is a breed of turtles 
+;;; which you desire to model as BDI, then you should have a BREED-own [beliefs intentions] declaration (along with any other 
+;;; variables that you wish to include in your model. 
+;;; MAKE SURE that when you create the variables you set their initial values to empty list ([]).
+;;; 2) YOU also must have ticks!! in your model (or timeout will not work).
+;;; 3) Your model should have a switch (check NetLogo manual) named "show-intentions" 
+
+;;; STEPH: extend model with b-type unique-key content optional-condition-for-replacement model instead of b-type content
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;; BELIEFS
+;; There is nothing magical about beliefs: they are simply items 
+;; of a specific list. Check list processing in NetLogo. However
+;; here are some usefull procedures. 
+
+;;; creates a new belief. (does not stores it in belief memory).
+to-report create-belief [b-type content]
+  report (list b-type content)
+end 
+
+;;; reports type of a belief.
+to-report belief-type [bel]
+  report first bel
+end
+
+;; reports the coontent of belief belief 
+to-report belief-content [bel]
+  report item 1 bel
+end
+
+;; Adding information to the beliefs structure
+to add-belief [bel]
+  if member? bel beliefs [stop]
+  set beliefs fput bel beliefs 
+end 
+;; Removing a belief from the list of beliefs. 
+to remove-belief [bel]
+ set beliefs remove bel beliefs 
+end 
+ 
+;;; return true if a specific belief belong to the set of beliefs
+to-report exists-belief [bel]
+   ifelse member? bel beliefs [report true] [report false]
+end
+
+;;; Reports true if a belief in the form of ["b-type" etc etc etc ...] exist in beliefs list
+to-report exist-beliefs-of-type [b-type]
+  let blfs filter [first ? = b-type] beliefs
+  ifelse empty? blfs [report false] [report true]
+end
+
+;;; Returns all beliefs of b-type in a list
+to-report beliefs-of-type [b-type]
+  report filter [first ? = b-type] beliefs
+end
+
+;;; Returns the first belief of a certain type and removes it
+to-report get-belief [b-type]
+  ifelse exist-beliefs-of-type b-type 
+  [let bel first filter [first ? = b-type] beliefs
+   remove-belief bel
+   report bel
+  ]
+  [report false]
+end
+
+to-report read-first-belief-of-type [b-type]
+  let bels beliefs-of-type b-type
+  ifelse not empty? bels
+  [ report first bels ]
+  [ report [] ]
+end 
+
+to update-belief [bel]
+   remove-belief read-first-belief-of-type belief-type bel
+   add-belief bel
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;; CODE FOR HANDLING INTENTIONS-A simple deliberative architecture
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to execute-intentions
+;;;locals [myInt]  ;; first intentions
+  if empty? intentions [stop]
+  let myInt get-intention
+  run intention-name myInt
+  if runresult intention-done myInt [remove-intention myInt]
+  if show-intentions [set label intentions] ;; Just for debugging. 
+end 
+
+;;;; Intentions Structure Access Functions
+;; returns the current intention of the agent
+to-report current-intention
+  report intention-name first intentions  
+end 
+
+;; Reports the full intention structure 
+to-report get-intention
+  ifelse empty? intentions [
+    report []
+  ]
+  [
+    report first intentions
+  ]
+end
+
+;; Reports the fill list of all intentions
+to-report get-intentions
+  ifelse empty? intentions [
+    report []
+  ]
+  [
+    report intentions
+  ]
+end
+
+;; Returns the intetnion name (the executable)
+to-report intention-name [intention]
+  report item 0 intention
+end
+
+;; return the done-methods (arguments) of the intention. If it evaluates to true 
+;; then the intention is removed. 
+to-report intention-done [intention]
+  report item 1 intention
+end 
+
+to pop-intention 
+  set intentions but-first intentions
+end
+
+;; Removes a specific intention from the intention stack 
+to remove-intention [bdi-lib##intention]
+  set intentions remove-item (position bdi-lib##intention intentions) intentions
+end 
+
+
+
+;; Adds an intention in the intentions list. REMEMBER that intentions are 
+;; stored in a STACK!
+;; The first argument is the intention name that should be some executable procedure 
+;; you encode in NetLogo. The second argument should be a REPORTER that when evaluates to 
+;; true the intention is removed (either accomplished or dropped). 
+;; BOTH ARGUMENTS HAVE TO BE STRINGS (see run/runresult primitive procedures in NetLogo)
+
+to add-intention [name done]
+  set intentions fput (list name done) intentions
+end 
+ 
+;;;; SPECIAL ACTIONS 
+;;; a null action
+to do-nothing
+end 
+
+;;; wait for something until the timeout expires.
+to wait-for-timeout 
+  do-nothing
+end 
+
+;;;
+to-report timeout_expired [timeout]
+report (word "timeout_has_expired " ticks " " timeout) 
+end
+
+;;; INTERNAL not to be USED. 
+;;; reports the end of the timeout. 
+to-report timeout_has_expired [start interval]
+  report (start + interval < ticks )
+end

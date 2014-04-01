@@ -1,0 +1,160 @@
+;;; File to be included in NetLogo Mutliagent Models
+;;; Communication for NetLogo Multiagent models
+;;; Includes primitives for message creation and handling in NetLogo 
+;;; Original Version for Netlogo 2 (2005) I. Sakellariou
+;;; Adapted to NetLogo 4 (2008) I. Sakellariou
+
+;;; Requirements
+;;; 1) All agents that are able to communicate MUST have a declated -own variable incoming-queue.
+;;; This is the variable to which all messages are recorded. So, in your model if there is a breed of turtles 
+;;; which you desire to communicate, then you should have a BREED-own [incoming-queue] declaration (along with any other 
+;;; variables that you wish to include in your model.
+;;; MAKE SURE that when you create the variables you set its values to empty list ([]).
+;;; 2) Your model should have a switch (check NetLogo manual) named "show_messages" 
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;; COMMUNICATION
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; MESSAGE PROCESSING ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Sending Messages
+;; (One man's send is another man's receive..)
+;; The second commented out line presents an alternative send implementation. 
+;; The commented out line represents an alternative method. 
+;; Problem: What if the agent I am sending the message is "killed" 
+;; Solution: Nothing Happens. Could yield an error message Alternative: create a safe send.
+to send [msg]
+  let recipients get-receivers msg
+  let recv 0
+  foreach recipients [
+    set recv turtle (read-from-string ?)
+    if recv != nobody [without-interruption [ask recv [receive msg]]] ;; read-from-string is required to convert the string to number
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Message reception deals with updating incoming-queue
+to receive [msg]
+   if show_messages [show msg]
+   set incoming-queue lput msg incoming-queue
+end 
+
+;; This reporter returns the next message in the list and removes it from the queue.
+to-report get-message
+  if empty? incoming-queue [report "no_message"]
+  let nextmsg first incoming-queue
+  remove-msg
+  report nextmsg     
+end 
+
+;; This reporter returns the next message in the list WITHOUT removimg it from the queue.
+to-report get-message-no-remove
+  if empty? incoming-queue [report "no_message"]
+  report first incoming-queue
+end
+
+;; Explicit remove-msg. 
+;; This is needed since reporters *cannot* change a variable's values (apparently). 
+to remove-msg
+  set incoming-queue but-first incoming-queue
+end 
+
+;; broadcasting to all agents of breed t-breed
+to broadcast-to [t-breed msg]
+  foreach [who] of t-breed [
+     send add-receiver ? msg
+  ]
+end
+
+
+;; Creating Messages and adding the sender.
+to-report create-message [performative]
+ report (list performative (word "sender:" who) )
+end
+
+to-report create-reply [performative msg]
+let msgOut 0
+    
+ set msgOut create-message performative
+ set msgOut add-receiver (get-sender msg) msgOut
+ report msgOut
+end 
+
+
+;; Accesing information on Messages
+;; Reports the sender of a message
+to-report get-sender [msg]
+  report remove "sender:" first (filter [not is-string? ? or (not is-number? ? and member? "sender:" ?)] msg) 
+  ;;report item ((position "sender:" msg) + 1) msg 
+end
+
+;; Reports (returns) the content of a message
+to-report get-content [msg]
+  report item (position "content:" msg + 1) msg 
+end
+
+;; Reports the list of receivers of a message
+to-report get-receivers [msg]
+  report map [remove "receiver:" ?] filter [not is-number? ? and is-string? ? and member? "receiver:" ?] (remove-field "content" msg)
+end
+
+;; Reports the specified field (when you use add)
+to-report get-field [field msg]
+  ifelse field = "content"
+  [ report get-content msg ]
+  [ report map [remove (word field ":") ?] filter [not is-number? ? and member? (word field ":") ?] (remove-field "content" msg) ]
+end 
+
+to-report remove-field [field msg]
+  ifelse field = "content"[
+    let pos position "content:" msg
+    report remove-item pos remove-item (pos + 1) msg
+  ]
+  [ report map [ifelse-value (not is-string? ?) [?] [remove (word field ":") ?]] filter [not is-string? ? or not member? (word field ":") ?] msg ]
+end
+
+;; reports the message performative. 
+to-report get-performative [msg]
+  report first msg
+end 
+
+;;; ADDING FIELDS TO A MESSAGE
+;; Adding a sender to a message.
+to-report add-sender [sender msg]
+  report add msg "sender:" sender
+end
+
+;; add a receiver
+to-report add-receiver [receiver msg]
+  if is-agent? receiver [ set receiver [who] of receiver ]
+  report add msg "receiver:" receiver
+end
+
+;; adding multiple recipients
+to-report add-multiple-receivers [receivers msg]
+  foreach receivers
+  [
+    set msg add-receiver ? msg
+  ]
+  report msg
+end
+
+;; Adding content to a message 
+to-report add-content [content msg]
+  report add msg "content:" content
+end
+
+;; Primitive Add command 
+to-report add-field [msg field value]
+  ifelse field = "content:"
+  [report lput value lput field msg]
+  [report lput (word field value) msg]
+end
+
+to-report add [msg field value]
+  report add-field msg field value
+end
