@@ -1,0 +1,9 @@
+How to launch
+=====================================
+
+First you need to install NetLogo 5.0.5 or greater, available here (works on Windows, Linux and MacOSX):
+http://ccl.northwestern.edu/netlogo/
+
+Then, unzip all the files contained in this archive in a single folder, because the bdi.nls and communication.nls are necessary extensions to run the simulation.
+
+Finally, to launch the simulation, double click on the file ProjetSMA.nlogo3d. This should open it with NetLogo 3D. If that's not the case and an error is shown (something like "you need to use NetLogo 3D for this file"), you just need to open NetLogo 3D and then open via NetLogo's interface the file ProjetSMA.nlogo3d .

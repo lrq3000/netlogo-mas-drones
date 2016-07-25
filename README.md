@@ -3,6 +3,12 @@ netlogo-mas-drones
 
 A 3D NetLogo 5 multi-agents system simulating a civil UAV drones mission, where they have to escort and protect a humanitarian convoy transporting a critical cargo.
 
+![drones-global][https://raw.githubusercontent.com/lrq3000/netlogo-mas-drones/master/img/drones-global.jpg]
+
+This simulation can also be played in first person mode, like a game:
+
+![drones-fpsmode][https://raw.githubusercontent.com/lrq3000/netlogo-mas-drones/master/img/drones-fpsmode.png]
+
 The flying UAV drones are totally autonomous, they can follow the convoy, look ahead of it, explore surroundings and detect potential threats and communicate their positions to the convoy to trace a new safer route. They are communicating wirelessly in a decentralized fashion by using three different techniques to ensure the reliability of communication and that their information is totally up-to-date with the latest findings from any of the other drones.
 
 You can see a color code for the drones depending on the communication status: blue when connected (directly or indirectly through other drones) to the head of the convoy (which constantly sends wireless beacons to the drones nearbies) ; orange when not connected to the convoy anymore (their info may get out of date until they meet the convoy or another drone that is connected to the convoy) ; red when dead (out of fuel). The yellow circle around the drones show the range of their wireless communication (aka: the "communication ring" which is in fact a 3D sphere).
