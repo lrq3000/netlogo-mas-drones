@@ -9,3 +9,9 @@ This simulation was done by Stephen Larroque, Olivier Hotel and Issam Bani as pa
 
 The source code can be downloaded here:
 https://github.com/lrq3000/netlogo-mas-drones
+
+A presentation explaining the techniques used can be found here:
+http://fr.slideshare.net/lrq3000/sma-presentationbanihotellarroque
+
+And a video demonstration can be found here:
+https://www.youtube.com/watch?v=ifWwJb-GWbQ&feature=youtu.be
