@@ -34,7 +34,7 @@ https://www.youtube.com/watch?v=ifWwJb-GWbQ
 
 ## Authors
 
-Stephen Larroque and Olivier Hotel for a Master project at University Pierre-and-Marie-Curie Paris 6.
+Code developed by Stephen Larroque and Olivier Hotel for a Master project at University Pierre-and-Marie-Curie Paris 6.
 
 ## License
 
