@@ -32,6 +32,8 @@ http://fr.slideshare.net/lrq3000/sma-presentationbanihotellarroque
 And a video demonstration can be found here:
 https://www.youtube.com/watch?v=ifWwJb-GWbQ
 
+This kind of flying support-escort drones technology is now investigated by the european military under the [Future Combat Air System (FCAS)](https://www.youtube.com/watch?v=Zdo5EKlcfYc).
+
 ## Authors
 
 Code developed by Stephen Larroque and Olivier Hotel for a Master project at University Pierre-and-Marie-Curie Paris 6.
