@@ -1,0 +1,28 @@
+{
+    "creators": [
+        {
+          "affiliation": "Pierre and Marie Curie University - Paris 6",
+          "name": "Larroque, Stephen Karl",
+          "orcid": "0000-0002-6248-0957"
+        },
+        {
+          "affiliation": "Pierre and Marie Curie University - Paris 6",
+          "name": "Hotel, Olivier"
+        },
+        {
+          "affiliation": "Pierre and Marie Curie University - Paris 6",
+          "name": "Bani, Issam"
+        }
+    ],
+    "keywords": [
+        "autonomous",
+        "drones",
+        "flying drones",
+        "UAV",
+        "netlogo",
+        "multi-agents simulation",
+        "wireless communications"
+    ],
+    "license": "MIT",
+    "upload_type": "software
+}
