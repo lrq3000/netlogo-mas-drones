@@ -8,10 +8,6 @@
         {
           "affiliation": "Pierre and Marie Curie University - Paris 6",
           "name": "Hotel, Olivier"
-        },
-        {
-          "affiliation": "Pierre and Marie Curie University - Paris 6",
-          "name": "Bani, Issam"
         }
     ],
     "keywords": [
@@ -24,5 +20,5 @@
         "wireless communications"
     ],
     "license": "MIT",
-    "upload_type": "software
+    "upload_type": "software"
 }
