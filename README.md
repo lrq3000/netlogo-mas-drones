@@ -1,6 +1,8 @@
 netlogo-mas-drones
 ==================
 
+[![DOI](https://zenodo.org/badge/18315390.svg)](https://zenodo.org/badge/latestdoi/18315390)
+
 A 3D NetLogo 5 multi-agents system simulating a civil UAV drones mission, where they have to escort and protect a humanitarian convoy transporting a critical cargo.
 
 ![drones-global](https://raw.githubusercontent.com/lrq3000/netlogo-mas-drones/master/img/drones-global.jpg)
@@ -37,6 +39,12 @@ This kind of flying support-escort drones technology is now investigated by the 
 ## Authors
 
 Code developed by Stephen Larroque and Olivier Hotel for a Master project at University Pierre-and-Marie-Curie Paris 6.
+
+## Citation
+
+Please cite this work as follows:
+
+> Larroque, Stephen Karl, & Hotel, Olivier. (2021, May 31). lrq3000/netlogo-mas-drones: Netlogo MAS Autonomous UAV drones simulation 1.0.1 (Version 1.0.1). Zenodo. http://doi.org/10.5281/zenodo.4885118
 
 ## License
 
