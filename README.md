@@ -44,7 +44,7 @@ Code developed by Stephen Larroque and Olivier Hotel for a Master project at Uni
 
 Please cite this work as follows:
 
-> Larroque, Stephen Karl, & Hotel, Olivier. (2021, May 31). lrq3000/netlogo-mas-drones: Netlogo MAS Autonomous UAV drones simulation 1.0.1 (Version 1.0.1). Zenodo. http://doi.org/10.5281/zenodo.4885118
+> Larroque, Stephen Karl, & Hotel, Olivier. (2021, May 31). lrq3000/netlogo-mas-drones: Netlogo MAS Autonomous UAV drones simulation 1.0.1 (Version 1.0.1). Zenodo. https://doi.org/10.5281/zenodo.4885117
 
 ## License
 
